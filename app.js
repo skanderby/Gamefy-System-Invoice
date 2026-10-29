@@ -132,10 +132,10 @@ function setupCollapseToggle() {
 // ---------------------------------------------------------------------------
 function setupDragDrop() {
   if (!dropZone) return;
-  ['dragenter','dragover'].forEach(evt => {
+  ['dragenter', 'dragover'].forEach(evt => {
     dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add('dragover'); });
   });
-  ['dragleave','drop'].forEach(evt => {
+  ['dragleave', 'drop'].forEach(evt => {
     dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.remove('dragover'); });
   });
   dropZone.addEventListener('drop', e => {
@@ -234,7 +234,7 @@ function removeFile(index) {
   console.log('removeFile called with index:', index);
   if (index < 0 || index >= pdfFiles.length) return;
   if (spreadsheetInstances[index]) {
-    try { spreadsheetInstances[index].destroy(); } catch (e) {}
+    try { spreadsheetInstances[index].destroy(); } catch (e) { }
     spreadsheetInstances[index] = null;
   }
   pdfFiles.splice(index, 1);
@@ -373,7 +373,7 @@ function initSpreadsheet(tabIndex) {
   container.innerHTML = '';
 
   if (spreadsheetInstances[tabIndex]) {
-    try { spreadsheetInstances[tabIndex].destroy(); } catch (e) {}
+    try { spreadsheetInstances[tabIndex].destroy(); } catch (e) { }
     spreadsheetInstances[tabIndex] = null;
   }
 
@@ -479,7 +479,7 @@ function updateReconciliation(tabIndex) {
   }
 }
 
-window.updateCashTpe = function(tabIndex) {
+window.updateCashTpe = function (tabIndex) {
   updateReconciliation(tabIndex);
   const f = pdfFiles[tabIndex];
   if (f) {
@@ -489,7 +489,7 @@ window.updateCashTpe = function(tabIndex) {
   updateDownloadButtons();
 };
 
-window.saveCashTpe = function(tabIndex) {
+window.saveCashTpe = function (tabIndex) {
   const f = pdfFiles[tabIndex];
   if (!f) return;
   f.cashAmount = parseFloat(document.getElementById(`cash-${tabIndex}`).value) || 0;
@@ -551,7 +551,7 @@ async function processAllFiles() {
   renderTabs();
 }
 
-window.processSingle = async function(tabIndex) {
+window.processSingle = async function (tabIndex) {
   if (!libsReady) { alert('Please wait for pdf.js to load'); return; }
   const f = pdfFiles[tabIndex];
   isProcessing = true;
@@ -657,285 +657,301 @@ function splitBody(body) {
 function parseTableText(text, day, month, year, sourceFile) {
   const entries = [];
 
+  // Preprocess: remove cashier names that appear right before each date-time
+  // pattern (e.g. "taktek 21.10.2026 01:50:49" → "21.10.2026 01:50:49").
+  // Without this, the cashier name leaks into the previous row's comment.
+  let cleanText = text.replace(/\b[a-zA-Z_]\w*\s+(?=\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2}:\d{2})/g, '');
+
+  // Strip PDF report footer/summary section (page 2+ metadata like
+  // "22/10/2026 16:35:21 Page 1/2 Filter Status : Cashier All ...")
+  cleanText = cleanText.replace(/\s*\d{1,2}\/\d{1,2}\/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+Page\s+\d+[\s\S]*/i, '');
+
   // Cut the text into one chunk per row (a row starts at a date + time).
   ROW_START_RE.lastIndex = 0;
   const starts = [];
   let start;
-  while ((start = ROW_START_RE.exec(text)) !== null) {
-    starts.push({
-      index: start.index,
-      headerLength: start[0].length,
-      day: parseInt(start[1], 10),
-      month: parseInt(start[2], 10),
-      year: parseInt(start[3], 10),
-    });
-  }
+    while ((start = ROW_START_RE.exec(cleanText)) !== null) {
+      starts.push({
+        index: start.index,
+        headerLength: start[0].length,
+        day: parseInt(start[1], 10),
+        month: parseInt(start[2], 10),
+        year: parseInt(start[3], 10),
+      });
+    }
 
-  for (let i = 0; i < starts.length; i++) {
-    const row = starts[i];
-    const chunkEnd = i + 1 < starts.length ? starts[i + 1].index : text.length;
-    let rest = text.slice(row.index + row.headerLength, chunkEnd).trim();
+    for (let i = 0; i < starts.length; i++) {
+      const row = starts[i];
+      const chunkEnd = i + 1 < starts.length ? starts[i + 1].index : cleanText.length;
+      let rest = cleanText.slice(row.index + row.headerLength, chunkEnd).trim();
 
-    const typeMatch = rest.match(/^(Income|Expense)\b\s*/i);
-    if (!typeMatch) continue;
-    const type = typeMatch[1].toLowerCase() === 'income' ? 'income' : 'expense';
-    rest = rest.slice(typeMatch[0].length);
+      const typeMatch = rest.match(/^(Income|Expense)\b\s*/i);
+      if (!typeMatch) continue;
+      const type = typeMatch[1].toLowerCase() === 'income' ? 'income' : 'expense';
+      rest = rest.slice(typeMatch[0].length);
 
-    const paymentMatch = rest.match(PAYMENT_RE);
-    if (paymentMatch) rest = rest.slice(paymentMatch[0].length);
+      const paymentMatch = rest.match(PAYMENT_RE);
+      if (paymentMatch) rest = rest.slice(paymentMatch[0].length);
 
-    const parts = splitBody(rest);
-    if (!parts) continue;
+      const parts = splitBody(rest);
+      if (!parts) continue;
 
-    const num = parseAmount(parts.amountStr);
-    if (!isFinite(num)) continue;
+      const num = parseAmount(parts.amountStr);
+      if (!isFinite(num)) continue;
 
-    const amount = type === 'expense' ? -Math.abs(num) : Math.abs(num);
+      const amount = type === 'expense' ? -Math.abs(num) : Math.abs(num);
 
-    let description = parts.description.replace(/\s+/g, ' ').trim();
-    if (!description || description.length < 2) description = 'Entry';
-    let comment = cleanComment(parts.comment);
+      let description = parts.description.replace(/\s+/g, ' ').trim();
+      if (!description || description.length < 2) description = 'Entry';
+      let comment = cleanComment(parts.comment);
 
-    // If comment is empty but description contains a trailing parenthetical
-    // identifier like "(GAMEFY03)" or "(PS5 (1))", extract it as the comment.
-    if (!comment && description.includes('(')) {
-      const firstParen = description.indexOf('(');
-      if (firstParen > 0) {
-        const potentialComment = description.slice(firstParen).trim();
-        const remaining = description.slice(0, firstParen).trim();
-        if (remaining.length > 2) {
-          const extracted = cleanComment(potentialComment);
-          if (extracted) {
-            comment = extracted;
-            description = remaining;
+      // If comment is empty but description contains a trailing parenthetical
+      // identifier like "(GAMEFY03)" or "(PS5 (1))", extract it as the comment.
+      if (!comment && description.includes('(')) {
+        const firstParen = description.indexOf('(');
+        if (firstParen > 0) {
+          const potentialComment = description.slice(firstParen).trim();
+          const remaining = description.slice(0, firstParen).trim();
+          if (remaining.length > 2) {
+            const extracted = cleanComment(potentialComment);
+            if (extracted) {
+              comment = extracted;
+              description = remaining;
+            }
           }
         }
       }
+
+      // If comment has a descriptive sentence (ending with ".") followed by
+      // a trailing parenthetical (like a member ID), keep only the sentence.
+      // e.g. "Money deposited to member account. (prime_, IIc7046)" → "Money deposited to member account."
+      if (comment) {
+        comment = comment.replace(/\.\s*\([^)]*\)\s*$/, '.').trim();
+      }
+
+      let entryDate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      if (row.day > 0 && row.day <= 31 && row.month > 0 && row.month <= 12) {
+        entryDate = `${String(row.year).padStart(4, '0')}-${String(row.month).padStart(2, '0')}-${String(row.day).padStart(2, '0')}`;
+      }
+
+      entries.push({
+        id: crypto.randomUUID?.() ?? `${day}-${month}-${Math.random()}`,
+        date: entryDate,
+        type, description, comment, amount,
+        sourceFile,
+      });
     }
 
-    let entryDate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-    if (row.day > 0 && row.day <= 31 && row.month > 0 && row.month <= 12) {
-      entryDate = `${String(row.year).padStart(4, '0')}-${String(row.month).padStart(2, '0')}-${String(row.day).padStart(2, '0')}`;
-    }
-
-    entries.push({
-      id: crypto.randomUUID?.() ?? `${day}-${month}-${Math.random()}`,
-      date: entryDate,
-      type, description, comment, amount,
-      sourceFile,
+    const seen = new Set();
+    return entries.filter(e => {
+      const k = `${e.date}|${e.type}|${e.description}|${e.amount}|${e.comment}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
     });
   }
 
-  const seen = new Set();
-  return entries.filter(e => {
-    const k = `${e.date}|${e.type}|${e.description}|${e.amount}|${e.comment}`;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Grid actions
-// ---------------------------------------------------------------------------
-window.addRow = function(tabIndex) {
-  const f = pdfFiles[tabIndex];
-  if (!f) return;
-  const d = `${f.year}-${String(f.month).padStart(2, '0')}-${String(f.day).padStart(2, '0')}`;
-  f.entries.push({
-    id: crypto.randomUUID?.() ?? Math.random().toString(),
-    date: d, type: 'expense', description: '', comment: '', amount: 0, sourceFile: f.name,
-  });
-  initSpreadsheet(tabIndex);
-  updateStats();
-};
-
-window.deleteLastRow = function(tabIndex) {
-  const f = pdfFiles[tabIndex];
-  if (!f || f.entries.length === 0) return;
-  f.entries.pop();
-  initSpreadsheet(tabIndex);
-  updateStats();
-};
-
-// ---------------------------------------------------------------------------
-// Week grouping
-// ---------------------------------------------------------------------------
-function weekOfMonth(day) {
-  return Math.ceil(day / 7);
-}
-
-function getAllEntries() {
-  const all = [];
-  for (const f of pdfFiles) {
-    for (const e of f.entries) {
-      all.push({ ...e, sourceFile: f.name });
-    }
-  }
-  return all;
-}
-
-function groupByWeek() {
-  const weeks = new Map();
-  for (const e of getAllEntries()) {
-    const d = new Date(e.date);
-    if (isNaN(d.getTime())) continue;
-    const wk = weekOfMonth(d.getDate());
-    if (!weeks.has(wk)) weeks.set(wk, []);
-    weeks.get(wk).push(e);
-  }
-  return weeks;
-}
-
-function categorize(description) {
-  const desc = description.toLowerCase();
-  for (const cat of CATEGORIES) {
-    for (const kw of cat.keywords) {
-      if (desc.includes(kw)) return cat.label;
-    }
-  }
-  return 'Other';
-}
-
-// ---------------------------------------------------------------------------
-// Reconciliation helpers
-// ---------------------------------------------------------------------------
-function totalAmounts(f) {
-  return f.entries.reduce((s, e) => s + e.amount, 0);
-}
-function totalIncome(f) {
-  return f.entries.filter(e => e.type === 'income').reduce((s, e) => s + Math.abs(e.amount), 0);
-}
-function totalExpense(f) {
-  return f.entries.filter(e => e.type === 'expense').reduce((s, e) => s + Math.abs(e.amount), 0);
-}
-function difference(f) {
-  const total = totalAmounts(f);
-  const cash = f.cashAmount || 0;
-  const tpe = f.tpeAmount || 0;
-  return (cash + tpe) - total;
-}
-
-// ---------------------------------------------------------------------------
-// Excel export: Daily (one sheet per day/file)
-// ---------------------------------------------------------------------------
-function downloadDailyExcel() {
-  if (!pdfFiles.length) { alert('Nothing to export'); return; }
-
-  const wb = XLSX.utils.book_new();
-
-  for (const f of pdfFiles) {
-    const rows = [['#', 'Date', 'Type', 'Description', 'Comment', 'Amount', 'Source File']];
-    f.entries.forEach((e, i) => {
-      rows.push([
-        i + 1,
-        e.date,
-        e.type.charAt(0).toUpperCase() + e.type.slice(1),
-        e.description,
-        e.comment || '',
-        e.type === 'income' ? +e.amount : -e.amount,
-        e.sourceFile,
-      ]);
+  // ---------------------------------------------------------------------------
+  // Grid actions
+  // ---------------------------------------------------------------------------
+  window.addRow = function (tabIndex) {
+    const f = pdfFiles[tabIndex];
+    if (!f) return;
+    const d = `${f.year}-${String(f.month).padStart(2, '0')}-${String(f.day).padStart(2, '0')}`;
+    f.entries.push({
+      id: crypto.randomUUID?.() ?? Math.random().toString(),
+      date: d, type: 'expense', description: '', comment: '', amount: 0, sourceFile: f.name,
     });
-    rows.push(['', '', '', 'Total Amounts', '', totalAmounts(f), '']);
-    rows.push(['', '', '', 'Total Cash', '', f.cashAmount || 0, '']);
-    rows.push(['', '', '', 'Total TPE', '', f.tpeAmount || 0, '']);
-    rows.push(['', '', '', 'Difference', '', difference(f), '']);
+    initSpreadsheet(tabIndex);
+    updateStats();
+  };
 
-    const ws = XLSX.utils.aoa_to_sheet(rows);
-    ws['!cols'] = [
-      { width: 5 }, { width: 12 }, { width: 10 }, { width: 38 }, { width: 20 }, { width: 14 }, { width: 15 },
-    ];
-    XLSX.utils.book_append_sheet(wb, ws, `Day ${f.day}-${f.month}`);
+  window.deleteLastRow = function (tabIndex) {
+    const f = pdfFiles[tabIndex];
+    if (!f || f.entries.length === 0) return;
+    f.entries.pop();
+    initSpreadsheet(tabIndex);
+    updateStats();
+  };
+
+  // ---------------------------------------------------------------------------
+  // Week grouping
+  // ---------------------------------------------------------------------------
+  function weekOfMonth(day) {
+    return Math.ceil(day / 7);
   }
 
-  const fname = `Gamefy_Daily_Invoices_Month${currentYear}.xlsx`;
-  XLSX.writeFile(wb, fname);
-  showToast('success', 'Downloaded', fname);
-}
+  function getAllEntries() {
+    const all = [];
+    for (const f of pdfFiles) {
+      for (const e of f.entries) {
+        all.push({ ...e, sourceFile: f.name });
+      }
+    }
+    return all;
+  }
 
-// ---------------------------------------------------------------------------
-// Excel export: Weekly (one sheet per week, all rows of the week)
-// ---------------------------------------------------------------------------
-function downloadWeeklyExcel() {
-  if (!pdfFiles.length) { alert('Nothing to export'); return; }
+  function groupByWeek() {
+    const weeks = new Map();
+    for (const e of getAllEntries()) {
+      const d = new Date(e.date);
+      if (isNaN(d.getTime())) continue;
+      const wk = weekOfMonth(d.getDate());
+      if (!weeks.has(wk)) weeks.set(wk, []);
+      weeks.get(wk).push(e);
+    }
+    return weeks;
+  }
 
-  const weeks = groupByWeek();
-  if (weeks.size === 0) { alert('No data to export'); return; }
+  function categorize(description) {
+    const desc = description.toLowerCase();
+    for (const cat of CATEGORIES) {
+      for (const kw of cat.keywords) {
+        if (desc.includes(kw)) return cat.label;
+      }
+    }
+    return 'Other';
+  }
 
-  const wb = XLSX.utils.book_new();
+  // ---------------------------------------------------------------------------
+  // Reconciliation helpers
+  // ---------------------------------------------------------------------------
+  function totalAmounts(f) {
+    return f.entries.reduce((s, e) => s + e.amount, 0);
+  }
+  function totalIncome(f) {
+    return f.entries.filter(e => e.type === 'income').reduce((s, e) => s + Math.abs(e.amount), 0);
+  }
+  function totalExpense(f) {
+    return f.entries.filter(e => e.type === 'expense').reduce((s, e) => s + Math.abs(e.amount), 0);
+  }
+  function difference(f) {
+    const total = totalAmounts(f);
+    const cash = f.cashAmount || 0;
+    const tpe = f.tpeAmount || 0;
+    return (cash + tpe) - total;
+  }
 
-  const weekNums = Array.from(weeks.keys()).sort((a, b) => a - b);
-  const addedSheets = new Set();
+  // ---------------------------------------------------------------------------
+  // Excel export: Daily (one sheet per day/file)
+  // ---------------------------------------------------------------------------
+  function downloadDailyExcel() {
+    if (!pdfFiles.length) { alert('Nothing to export'); return; }
 
-  for (const wk of weekNums) {
-    const sheetName = `Week ${wk}`;
-    if (addedSheets.has(sheetName)) continue;
-    addedSheets.add(sheetName);
-    const entries = weeks.get(wk);
-    const startDay = (wk - 1) * 7 + 1;
-    const endDay = Math.min(wk * 7, 31);
-    const weekTitle = `Vente ${wk}ème semaine`;
+    const wb = XLSX.utils.book_new();
 
-    const rows = [];
+    for (const f of pdfFiles) {
+      const rows = [['#', 'Date', 'Type', 'Description', 'Comment', 'Amount', 'Source File']];
+      f.entries.forEach((e, i) => {
+        rows.push([
+          i + 1,
+          e.date,
+          e.type.charAt(0).toUpperCase() + e.type.slice(1),
+          e.description,
+          e.comment || '',
+          e.type === 'income' ? +e.amount : -e.amount,
+          e.sourceFile,
+        ]);
+      });
+      rows.push(['', '', '', 'Total Amounts', '', totalAmounts(f), '']);
+      rows.push(['', '', '', 'Total Cash', '', f.cashAmount || 0, '']);
+      rows.push(['', '', '', 'Total TPE', '', f.tpeAmount || 0, '']);
+      rows.push(['', '', '', 'Difference', '', difference(f), '']);
 
-    rows.push([weekTitle, '', '', '', '', '', '']);
-    rows.push(['Days ' + startDay + ' to ' + endDay, '', '', '', '', '', '']);
-    rows.push(['', '', '', '', '', '', '']);
-
-    rows.push(['#', 'Date', 'Type', 'Description', 'Comment', 'Amount', 'Source File']);
-
-    let rowNum = 1;
-    for (const e of entries) {
-      rows.push([
-        rowNum++,
-        e.date,
-        e.type.charAt(0).toUpperCase() + e.type.slice(1),
-        e.description,
-        e.comment || '',
-        e.type === 'income' ? Math.abs(e.amount) : -Math.abs(e.amount),
-        e.sourceFile || '',
-      ]);
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      ws['!cols'] = [
+        { width: 5 }, { width: 12 }, { width: 10 }, { width: 38 }, { width: 20 }, { width: 14 }, { width: 15 },
+      ];
+      XLSX.utils.book_append_sheet(wb, ws, `Day ${f.day}-${f.month}`);
     }
 
-    const ws = XLSX.utils.aoa_to_sheet(rows);
-
-    ws['!cols'] = [
-      { width: 8 },
-      { width: 12 },
-      { width: 12 },
-      { width: 40 },
-      { width: 20 },
-      { width: 14 },
-      { width: 20 },
-    ];
-
-    XLSX.utils.book_append_sheet(wb, ws, `Week ${wk}`);
+    const fname = `Gamefy_Daily_Invoices_Month${currentYear}.xlsx`;
+    XLSX.writeFile(wb, fname);
+    showToast('success', 'Downloaded', fname);
   }
 
-  const fname = `Gamefy_Weekly_Invoices_Month${currentYear}.xlsx`;
-  XLSX.writeFile(wb, fname);
-  showToast('success', 'Downloaded', fname);
-}
+  // ---------------------------------------------------------------------------
+  // Excel export: Weekly (one sheet per week, all rows of the week)
+  // ---------------------------------------------------------------------------
+  function downloadWeeklyExcel() {
+    if (!pdfFiles.length) { alert('Nothing to export'); return; }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-function escapeHtml(t) {
-  if (t == null) return '';
-  return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
+    const weeks = groupByWeek();
+    if (weeks.size === 0) { alert('No data to export'); return; }
 
-function formatMoney(n) {
-  const v = Number(n) || 0;
-  return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
+    const wb = XLSX.utils.book_new();
 
-window.app = {
-  removeFile,
-  processSingle: window.processSingle,
-  addRow: window.addRow,
-  deleteLastRow: window.deleteLastRow,
-  updateCashTpe: window.updateCashTpe,
-  saveCashTpe: window.saveCashTpe,
-};
+    const weekNums = Array.from(weeks.keys()).sort((a, b) => a - b);
+    const addedSheets = new Set();
+
+    for (const wk of weekNums) {
+      const sheetName = `Week ${wk}`;
+      if (addedSheets.has(sheetName)) continue;
+      addedSheets.add(sheetName);
+      const entries = weeks.get(wk);
+      const startDay = (wk - 1) * 7 + 1;
+      const endDay = Math.min(wk * 7, 31);
+      const weekTitle = `Vente ${wk}ème semaine`;
+
+      const rows = [];
+
+      rows.push([weekTitle, '', '', '', '', '', '']);
+      rows.push(['Days ' + startDay + ' to ' + endDay, '', '', '', '', '', '']);
+      rows.push(['', '', '', '', '', '', '']);
+
+      rows.push(['#', 'Date', 'Type', 'Description', 'Comment', 'Amount', 'Source File']);
+
+      let rowNum = 1;
+      for (const e of entries) {
+        rows.push([
+          rowNum++,
+          e.date,
+          e.type.charAt(0).toUpperCase() + e.type.slice(1),
+          e.description,
+          e.comment || '',
+          e.type === 'income' ? Math.abs(e.amount) : -Math.abs(e.amount),
+          e.sourceFile || '',
+        ]);
+      }
+
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+
+      ws['!cols'] = [
+        { width: 8 },
+        { width: 12 },
+        { width: 12 },
+        { width: 40 },
+        { width: 20 },
+        { width: 14 },
+        { width: 20 },
+      ];
+
+      XLSX.utils.book_append_sheet(wb, ws, `Week ${wk}`);
+    }
+
+    const fname = `Gamefy_Weekly_Invoices_Month${currentYear}.xlsx`;
+    XLSX.writeFile(wb, fname);
+    showToast('success', 'Downloaded', fname);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+  function escapeHtml(t) {
+    if (t == null) return '';
+    return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function formatMoney(n) {
+    const v = Number(n) || 0;
+    return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  window.app = {
+    removeFile,
+    processSingle: window.processSingle,
+    addRow: window.addRow,
+    deleteLastRow: window.deleteLastRow,
+    updateCashTpe: window.updateCashTpe,
+    saveCashTpe: window.saveCashTpe,
+  };
