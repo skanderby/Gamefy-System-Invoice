@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gamefy — Invoice Builder</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <script type="module" src="assets/pdfjs/pdf.js"></script>
+  <script src="https://bossanova.uk/jspreadsheet/v4/jexcel.js"></script>
+  <link rel="stylesheet" href="https://bossanova.uk/jspreadsheet/v4/jexcel.css" type="text/css" />
+  <script src="https://jsuites.net/v4/jsuites.js"></script>
+  <link rel="stylesheet" href="https://jsuites.net/v4/jsuites.css" type="text/css" />
+  <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="app-container">
+    <header>
+      <div class="brand-section">
+        <div class="logo-icon">G</div>
+        <div class="brand-title">
+          <h1>Gamefy</h1>
+          <p>Daily tables → weekly invoice</p>
+        </div>
+      </div>
+      <div class="stats-bar">
+        <div class="stat-pill">
+          <span class="stat-pill-value" id="stats-files">0</span>
+          <span class="stat-pill-label">files</span>
+        </div>
+        <div class="stat-pill">
+          <span class="stat-pill-value" id="stats-entries">0</span>
+          <span class="stat-pill-label">rows</span>
+        </div>
+      </div>
+    </header>
+
+    <section id="step-drop" class="panel upload-panel">
+      <div class="step-header">
+        <div class="step-header-left">
+          <div>
+            <h2 class="step-title">PDFs</h2>
+            <p class="step-subtitle">Name files <code>day-month.pdf</code> — one day each</p>
+          </div>
+        </div>
+        <button class="btn btn-ghost" id="btnCollapseUpload" type="button" title="Hide upload">
+          Hide
+        </button>
+      </div>
+
+      <div class="upload-collapsed-bar" id="uploadCollapsedBar">
+        <div class="collapsed-summary">
+          <span id="collapsedSummaryText">No files yet</span>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btnExpandUpload" type="button">Add PDFs</button>
+      </div>
+
+      <div class="upload-panel-body" id="uploadPanelBody">
+        <div class="drop-zone" id="dropZone">
+          <h2 class="drop-title">Drop PDFs here</h2>
+          <p class="drop-hint">or <a class="browse-link" id="browseLink">browse</a></p>
+          <input type="file" id="fileInput" multiple accept=".pdf" hidden />
+        </div>
+
+        <div id="fileList" class="file-list"></div>
+
+        <div class="step-actions">
+          <button class="btn btn-primary" id="btnExtract" disabled>
+            <span id="extractSpinner" class="spinner" style="display:none;"></span>
+            Extract tables
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <section id="step-tabs" class="panel workspace" hidden>
+      <div class="tab-toolbar">
+        <div class="toolbar-left">
+          <button class="btn btn-ghost" id="btnMoreFiles">+ PDFs</button>
+        </div>
+        <div class="toolbar-right">
+          <button class="btn btn-secondary" id="btnDownloadDaily">Daily Excel</button>
+          <button class="btn btn-primary" id="btnDownloadWeekly">Weekly Excel</button>
+        </div>
+      </div>
+
+      <div id="tabContainer">
+        <div class="tabs-header" id="tabsHeader"></div>
+        <div class="tabs-panels" id="tabsPanels"></div>
+      </div>
+    </section>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
