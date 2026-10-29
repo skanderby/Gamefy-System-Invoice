@@ -1,0 +1,1144 @@
+/**
+ * Gamefy Invoice Builder — Plain HTML/JS (like Tuneps)
+ * - Drop PDFs named day-month (e.g. 15-03.pdf)
+ * - Extract income/expense table via pdf.js
+ * - One Jspreadsheet Excel editor tab per file
+ * - Reconciliation: Total Amounts, Total Cash, Total TPE, Difference
+ * - Download Daily Excel (one sheet per day)
+ * - Download Weekly Excel (all rows per week + accounting summary)
+ */
+
+import * as pdfjsLib from './assets/pdfjs/pdf.js';
+pdfjsLib.GlobalWorkerOptions.workerSrc = './assets/pdfjs/pdf.worker.js';
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let pdfFiles = [];        // { file, name, day, month, year, entries[], processed, cashAmount, tpeAmount }
+let spreadsheetInstances = {}; // tabIndex -> jspreadsheet instance
+let currentYear = new Date().getFullYear();
+let libsReady = false;
+let isProcessing = false;
+let isDownloading = false;
+let activeTabIndex = 0;
+let isUploadCollapsed = false;
+
+const EXCEL_COLS = [
+  { key: 'rowNum', label: '#', width: 50 },
+  { key: 'date', label: 'Date', width: 110 },
+  { key: 'type', label: 'Type', width: 100 },
+  { key: 'description', label: 'Description', width: 260 },
+  { key: 'comment', label: 'Comment', width: 260 },
+  { key: 'amount', label: 'Amount', width: 120 },
+  { key: 'sourceFile', label: 'Source File', width: 150 },
+];
+
+const CATEGORIES = [
+  { key: 'COMPUTER', label: 'COMPUTER', keywords: ['computer'] },
+  { key: 'MEMBER', label: 'Member Transactions', keywords: ['member'] },
+  { key: 'PLAYSTATION', label: 'Playstation Incomes', keywords: ['playstation'] },
+  { key: 'ORDER', label: 'Order Incomes', keywords: ['order'] },
+  { key: 'COWORKING', label: 'Co-working', keywords: ['co-working', 'coworking', 'co working'] },
+  { key: 'PASS', label: 'PASS EVENEMENT', keywords: ['pass', 'evenement', 'événement'] },
+];
+
+// ---------------------------------------------------------------------------
+// DOM elements
+// ---------------------------------------------------------------------------
+let dropZone, fileInput, browseLink, fileList, btnExtract, extractSpinner;
+let stepDrop, stepTabs, tabsHeader, tabsPanels, btnMoreFiles, btnDownloadDaily, btnDownloadWeekly;
+let statsFiles, statsEntries, btnCollapseUpload, btnExpandUpload, collapsedSummaryText;
+
+function initDOM() {
+  dropZone = document.getElementById('dropZone');
+  fileInput = document.getElementById('fileInput');
+  browseLink = document.getElementById('browseLink');
+  fileList = document.getElementById('fileList');
+  btnExtract = document.getElementById('btnExtract');
+  extractSpinner = document.getElementById('extractSpinner');
+  stepDrop = document.getElementById('step-drop');
+  stepTabs = document.getElementById('step-tabs');
+  tabsHeader = document.getElementById('tabsHeader');
+  tabsPanels = document.getElementById('tabsPanels');
+  btnMoreFiles = document.getElementById('btnMoreFiles');
+  btnDownloadDaily = document.getElementById('btnDownloadDaily');
+  btnDownloadWeekly = document.getElementById('btnDownloadWeekly');
+  statsFiles = document.getElementById('stats-files');
+  statsEntries = document.getElementById('stats-entries');
+  btnCollapseUpload = document.getElementById('btnCollapseUpload');
+  btnExpandUpload = document.getElementById('btnExpandUpload');
+  collapsedSummaryText = document.getElementById('collapsedSummaryText');
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+window.addEventListener('DOMContentLoaded', () => {
+  initDOM();
+  setupDragDrop();
+  setupFileInput();
+  setupButtons();
+  setupCollapseToggle();
+  updateStats();
+  updateDownloadButtons();
+  updateExtractButton();
+  setUploadCollapsed(false);
+  libsReady = true;
+  console.log('Libs ready, pdfjsLib:', typeof pdfjsLib, 'jspreadsheet:', typeof jspreadsheet);
+});
+
+// ---------------------------------------------------------------------------
+// Collapse / Expand toggle
+// ---------------------------------------------------------------------------
+function setupCollapseToggle() {
+  if (btnCollapseUpload) btnCollapseUpload.addEventListener('click', () => setUploadCollapsed(true));
+  if (btnExpandUpload) btnExpandUpload.addEventListener('click', () => setUploadCollapsed(false));
+}
+
+function setUploadCollapsed(collapsed) {
+  isUploadCollapsed = collapsed;
+  if (!stepDrop) return;
+  stepDrop.classList.toggle('collapsed', collapsed);
+  if (btnCollapseUpload) {
+    btnCollapseUpload.style.display = collapsed || pdfFiles.length === 0 ? 'none' : '';
+  }
+  updateCollapsedSummary();
+}
+
+function updateCollapsedSummary() {
+  if (!collapsedSummaryText) return;
+  const total = pdfFiles.reduce((s, f) => s + (f.entries?.length || 0), 0);
+  const noTable = pdfFiles.filter(f => f.processed && !f.entries.length).length;
+  const parts = [`${pdfFiles.length} PDF${pdfFiles.length === 1 ? '' : 's'}`, `${total} entr${total === 1 ? 'y' : 'ies'}`];
+  if (noTable) parts.push(`${noTable} without a table`);
+  collapsedSummaryText.textContent = parts.join(' · ');
+}
+
+// ---------------------------------------------------------------------------
+// Setup helpers
+// ---------------------------------------------------------------------------
+function setupDragDrop() {
+  if (!dropZone) return;
+  ['dragenter','dragover'].forEach(evt => {
+    dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+  });
+  ['dragleave','drop'].forEach(evt => {
+    dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.remove('dragover'); });
+  });
+  dropZone.addEventListener('drop', e => {
+    const files = Array.from(e.dataTransfer.files).filter(f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
+    addFiles(files);
+  });
+  dropZone.addEventListener('click', e => {
+    if (e.target.closest('a, button, input')) return;
+    if (fileInput) fileInput.click();
+  });
+}
+
+function setupFileInput() {
+  if (!fileInput) return;
+  fileInput.addEventListener('change', e => {
+    addFiles(Array.from(fileInput.files));
+    fileInput.value = '';
+  });
+  if (browseLink) browseLink.addEventListener('click', e => { e.preventDefault(); fileInput.click(); });
+}
+
+function setupButtons() {
+  if (btnExtract) btnExtract.addEventListener('click', onExtractClick);
+  if (btnDownloadDaily) btnDownloadDaily.addEventListener('click', onDownloadDaily);
+  if (btnDownloadWeekly) btnDownloadWeekly.addEventListener('click', onDownloadWeekly);
+  if (btnMoreFiles) btnMoreFiles.addEventListener('click', () => {
+    setUploadCollapsed(false);
+    if (stepDrop) stepDrop.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+function validateCashTpe() {
+  const unfilled = pdfFiles.filter(f => (f.cashAmount || 0) === 0 && (f.tpeAmount || 0) === 0);
+  if (unfilled.length > 0) {
+    const names = unfilled.map(f => `Day ${f.day}/${f.month}`).join(', ');
+    showToast('error', 'Cash/TPE not filled', `Please fill Cash or TPE for: ${names}`);
+    return false;
+  }
+  return true;
+}
+
+function updateDownloadButtons() {
+  const allFilled = pdfFiles.every(f => (f.cashAmount || 0) > 0 || (f.tpeAmount || 0) > 0);
+  if (btnDownloadDaily) btnDownloadDaily.disabled = !allFilled || pdfFiles.length === 0;
+  if (btnDownloadWeekly) btnDownloadWeekly.disabled = !allFilled || pdfFiles.length === 0;
+}
+
+function updateExtractButton() {
+  if (btnExtract) btnExtract.disabled = pdfFiles.length === 0 || isProcessing;
+}
+
+// ---------------------------------------------------------------------------
+// Toast notification
+// ---------------------------------------------------------------------------
+function showToast(severity, summary, detail) {
+  const existing = document.getElementById('gamefy-toast');
+  if (existing) existing.remove();
+
+  const toast = document.createElement('div');
+  toast.id = 'gamefy-toast';
+  toast.className = `toast ${severity}`;
+  toast.innerHTML = `
+    <div class="toast-header">
+      <strong>${summary}</strong>
+      <button type="button" onclick="document.getElementById('gamefy-toast').remove()">×</button>
+    </div>
+    <div class="toast-body">${detail}</div>
+  `;
+  document.body.appendChild(toast);
+
+  setTimeout(() => {
+    if (toast.parentNode) toast.remove();
+  }, 5000);
+}
+
+// ---------------------------------------------------------------------------
+// Files
+// ---------------------------------------------------------------------------
+function addFiles(files) {
+  console.log('addFiles called with', files.length, 'files');
+  for (const f of files) {
+    const parsed = parseDayMonth(f.name);
+    if (!parsed) {
+      alert(`Skipped "${f.name}": name must be like 15-03.pdf (day-month)`);
+      continue;
+    }
+    if (pdfFiles.some(x => x.name === f.name && x.day === parsed.day && x.month === parsed.month)) continue;
+    pdfFiles.push({
+      file: f, name: f.name, day: parsed.day, month: parsed.month, year: currentYear,
+      entries: [], processed: false, cashAmount: 0, tpeAmount: 0
+    });
+  }
+  renderFileList();
+  updateStats();
+  updateDownloadButtons();
+  updateExtractButton();
+  setUploadCollapsed(false);
+}
+
+function removeFile(index) {
+  console.log('removeFile called with index:', index);
+  if (index < 0 || index >= pdfFiles.length) return;
+  if (spreadsheetInstances[index]) {
+    try { spreadsheetInstances[index].destroy(); } catch (e) {}
+    spreadsheetInstances[index] = null;
+  }
+  pdfFiles.splice(index, 1);
+  if (pdfFiles.length === 0) {
+    setUploadCollapsed(false);
+    if (stepTabs) stepTabs.hidden = true;
+    activeTabIndex = 0;
+  } else {
+    if (activeTabIndex >= pdfFiles.length) activeTabIndex = pdfFiles.length - 1;
+    renderTabs();
+  }
+  updateStats();
+  updateDownloadButtons();
+  updateExtractButton();
+}
+
+function parseDayMonth(name) {
+  const m = name.match(/^(\d{1,2})[-_](\d{1,2})/);
+  if (!m) return null;
+  return { day: parseInt(m[1], 10), month: parseInt(m[2], 10) };
+}
+
+function renderFileList() {
+  if (!fileList) return;
+  fileList.innerHTML = '';
+  for (let i = 0; i < pdfFiles.length; i++) {
+    const f = pdfFiles[i];
+    const card = document.createElement('div');
+    card.className = 'file-card-item';
+    const status = f.processed ? (f.entries.length ? '✓ ' + f.entries.length + ' entries' : '⚠ No table') : 'Pending';
+    const statusClass = f.processed && f.entries.length ? 'status-ok' : (f.processed ? 'status-warn' : 'status-info');
+    card.innerHTML = `
+      <div class="file-info">
+        <span class="file-name">${escapeHtml(f.name)}</span>
+        <span class="file-badge ${statusClass}">${status}</span>
+      </div>
+      <div class="file-meta">
+        <span>${f.day}/${f.month}</span>
+      </div>
+      <button class="btn btn-danger btn-sm" onclick="window.app.removeFile(${i})">Remove</button>
+    `;
+    fileList.appendChild(card);
+  }
+}
+
+function updateStats() {
+  if (!statsFiles || !statsEntries) return;
+  statsFiles.textContent = pdfFiles.length;
+  const totalEntries = pdfFiles.reduce((s, f) => s + f.entries.length, 0);
+  statsEntries.textContent = totalEntries;
+  updateCollapsedSummary();
+}
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+function renderTabs() {
+  console.log('renderTabs called, activeTabIndex:', activeTabIndex, 'files:', pdfFiles.length);
+  if (!tabsHeader || !tabsPanels) {
+    console.error('tabsHeader or tabsPanels is null!');
+    return;
+  }
+  tabsHeader.innerHTML = '';
+  tabsPanels.innerHTML = '';
+
+  pdfFiles.forEach((f, i) => {
+    const isActive = i === activeTabIndex;
+
+    const tabBtn = document.createElement('button');
+    tabBtn.className = 'tab-btn' + (isActive ? ' active' : '');
+    tabBtn.textContent = `${f.day}/${f.month}`;
+    tabBtn.onclick = () => { activeTabIndex = i; renderTabs(); initSpreadsheet(i); };
+    tabsHeader.appendChild(tabBtn);
+
+    const panel = document.createElement('div');
+    panel.className = 'tab-panel' + (isActive ? ' active' : '');
+    if (!isActive) panel.style.display = 'none';
+    const chipClass = f.processed ? (f.entries.length ? 'status-ok' : 'status-warn') : 'status-info';
+    const chipText = f.processed ? (f.entries.length ? f.entries.length + ' rows' : 'No table') : 'Pending';
+    panel.innerHTML = `
+      <div class="file-tab-card">
+        <div class="file-tab-actions">
+          <button class="btn btn-ghost btn-sm" onclick="window.app.processSingle(${i})" ${isProcessing ? 'disabled' : ''}>
+            <span class="spinner" style="display:${isProcessing ? 'inline-block' : 'none'};"></span>
+            ${isProcessing ? 'Working…' : 'Re-extract'}
+          </button>
+          <button class="btn btn-ghost btn-sm" onclick="window.app.addRow(${i})">Add row</button>
+          <button class="btn btn-ghost btn-sm" onclick="window.app.deleteLastRow(${i})">Delete last</button>
+          <span class="entry-chip file-badge ${chipClass}">${chipText}</span>
+        </div>
+        <div id="spreadsheet-${i}" class="spreadsheet-container">
+          <div class="spreadsheet-loading">Opening table…</div>
+        </div>
+        <div class="reconciliation-card">
+          <h3 class="recon-title">Reconciliation</h3>
+          <div class="recon-grid">
+            <div class="recon-item income-item">
+              <div class="recon-label">Total</div>
+              <div class="recon-value total" id="total-amounts-${i}">0.00</div>
+            </div>
+            <div class="recon-item cash-item">
+              <div class="recon-label">Cash</div>
+              <input type="number" id="cash-${i}" min="0" step="0.01" value="${f.cashAmount || 0}" class="recon-input" onchange="window.app.updateCashTpe(${i})" />
+            </div>
+            <div class="recon-item tpe-item">
+              <div class="recon-label">TPE</div>
+              <input type="number" id="tpe-${i}" min="0" step="0.01" value="${f.tpeAmount || 0}" class="recon-input" onchange="window.app.updateCashTpe(${i})" />
+            </div>
+            <div class="recon-item difference-item">
+              <div class="recon-label">Difference</div>
+              <div class="recon-value difference" id="diff-${i}">0.00</div>
+            </div>
+          </div>
+          <div class="recon-item save-item">
+            <button class="btn btn-primary btn-sm" onclick="window.app.saveCashTpe(${i})" id="save-btn-${i}">Save</button>
+          </div>
+        </div>
+      </div>
+    `;
+    tabsPanels.appendChild(panel);
+  });
+
+  setTimeout(() => initSpreadsheet(activeTabIndex), 100);
+}
+
+function initSpreadsheet(tabIndex) {
+  const f = pdfFiles[tabIndex];
+  if (!f) { console.error('No file at tabIndex', tabIndex); return; }
+
+  const container = document.getElementById(`spreadsheet-${tabIndex}`);
+  if (!container) { console.error('Container not found for tab', tabIndex); return; }
+  container.innerHTML = '';
+
+  if (spreadsheetInstances[tabIndex]) {
+    try { spreadsheetInstances[tabIndex].destroy(); } catch (e) {}
+    spreadsheetInstances[tabIndex] = null;
+  }
+
+  console.log('Creating jspreadsheet for tab', tabIndex, 'entries:', f.entries.length);
+
+  const columns = [
+    { type: 'text', title: '#', width: 50, readonly: true },
+    { type: 'text', title: 'Date', width: 110 },
+    { type: 'dropdown', title: 'Type', width: 100, source: ['Income', 'Expense'] },
+    { type: 'text', title: 'Description', width: 260, wordWrap: true },
+    { type: 'text', title: 'Comment', width: 260, wordWrap: true },
+    { type: 'numeric', title: 'Amount', width: 120, align: 'right', mask: '#,##0.00' },
+    { type: 'text', title: 'Source File', width: 150, readonly: true },
+  ];
+
+  const entries = f.entries || [];
+
+  // Ensure we always have at least one row for jspreadsheet
+  let data;
+  if (entries.length === 0) {
+    data = [[
+      '1',
+      '',
+      '',
+      '',
+      '',
+      0,
+      '',
+    ]];
+  } else {
+    data = entries.map((e, i) => [
+      String(i + 1),
+      e.date || '',
+      e.type.charAt(0).toUpperCase() + e.type.slice(1),
+      e.description || '',
+      e.comment || '',
+      e.amount || 0,
+      e.sourceFile || '',
+    ]);
+  }
+
+  try {
+    const inst = jspreadsheet(container, {
+      data: data,
+      columns: columns,
+      search: true,
+      filters: true,
+      pagination: 25,
+      tableOverflow: true,
+      tableWidth: '100%',
+      tableHeight: '480px',
+      wordWrap: true,
+      onchange: (worksheet, cell, x, y, value) => {
+        handleSpreadsheetChange(tabIndex, y, x, value);
+      },
+    });
+
+    spreadsheetInstances[tabIndex] = inst;
+    console.log('jspreadsheet created successfully for tab', tabIndex);
+    updateReconciliation(tabIndex);
+  } catch (err) {
+    console.error('jspreadsheet error:', err);
+    container.innerHTML = '<div style="padding:20px;color:#ef4444;">Excel editor failed to load.</div>';
+  }
+}
+
+function handleSpreadsheetChange(tabIndex, rowIndex, colIndex, value) {
+  const f = pdfFiles[tabIndex];
+  if (!f || rowIndex >= f.entries.length) return;
+  const e = f.entries[rowIndex];
+  const key = EXCEL_COLS[colIndex].key;
+  switch (key) {
+    case 'date': e.date = value || ''; break;
+    case 'type': e.type = (String(value).toLowerCase() === 'income' ? 'income' : 'expense'); break;
+    case 'description': e.description = value || ''; break;
+    case 'comment': e.comment = value || ''; break;
+    case 'amount': e.amount = parseFloat(value) || 0; break;
+  }
+  updateReconciliation(tabIndex);
+  updateStats();
+  updateDownloadButtons();
+}
+
+function updateReconciliation(tabIndex) {
+  const f = pdfFiles[tabIndex];
+  if (!f) return;
+
+  const total = f.entries.reduce((s, e) => s + e.amount, 0);
+  const cashEl = document.getElementById(`cash-${tabIndex}`);
+  const tpeEl = document.getElementById(`tpe-${tabIndex}`);
+  const cash = cashEl ? (parseFloat(cashEl.value) || 0) : 0;
+  const tpe = tpeEl ? (parseFloat(tpeEl.value) || 0) : 0;
+  const diff = total - (cash + tpe);
+
+  const totalEl = document.getElementById(`total-amounts-${tabIndex}`);
+  const diffEl = document.getElementById(`diff-${tabIndex}`);
+  if (totalEl) totalEl.textContent = formatMoney(total);
+  if (diffEl) {
+    diffEl.textContent = (diff >= 0 ? '+' : '−') + formatMoney(Math.abs(diff));
+    diffEl.className = 'recon-value difference ' + (diff >= 0 ? 'diff-positive' : 'diff-negative');
+  }
+}
+
+window.updateCashTpe = function(tabIndex) {
+  updateReconciliation(tabIndex);
+  const f = pdfFiles[tabIndex];
+  if (f) {
+    f.cashAmount = parseFloat(document.getElementById(`cash-${tabIndex}`).value) || 0;
+    f.tpeAmount = parseFloat(document.getElementById(`tpe-${tabIndex}`).value) || 0;
+  }
+  updateDownloadButtons();
+};
+
+window.saveCashTpe = function(tabIndex) {
+  const f = pdfFiles[tabIndex];
+  if (!f) return;
+  f.cashAmount = parseFloat(document.getElementById(`cash-${tabIndex}`).value) || 0;
+  f.tpeAmount = parseFloat(document.getElementById(`tpe-${tabIndex}`).value) || 0;
+  updateReconciliation(tabIndex);
+  updateDownloadButtons();
+  showToast('success', 'Saved', `Cash/TPE saved for Day ${f.day}/${f.month}`);
+};
+
+// ---------------------------------------------------------------------------
+// PDF processing
+// ---------------------------------------------------------------------------
+function onExtractClick() {
+  console.log('Extract clicked, files:', pdfFiles.length);
+  if (!pdfFiles.length) {
+    showToast('error', 'No files', 'Please drop PDF files first.');
+    return;
+  }
+  if (!libsReady) { alert('Please wait for pdf.js to load'); return; }
+  isProcessing = true;
+  if (btnExtract) { btnExtract.disabled = true; if (extractSpinner) extractSpinner.style.display = 'inline-block'; }
+  processAllFiles().then(() => {
+    isProcessing = false;
+    const total = pdfFiles.reduce((s, f) => s + f.entries.length, 0);
+    const empty = pdfFiles.filter(f => !f.entries.length).length;
+    if (stepTabs) {
+      stepTabs.hidden = false;
+      stepTabs.style.display = '';
+    }
+    setUploadCollapsed(true);
+    renderFileList();
+    renderTabs();
+    if (total) {
+      showToast('success', 'Extraction complete', `${total} row${total === 1 ? '' : 's'} from ${pdfFiles.length} PDF${pdfFiles.length === 1 ? '' : 's'}${empty ? ` · ${empty} without a table` : ''}`);
+    } else {
+      showToast('error', 'No table found', 'Could not detect income/expense rows. Re-process after checking the PDF has selectable text.');
+    }
+  }).catch(err => {
+    console.error(err);
+    showToast('error', 'Extraction failed', err.message || String(err));
+  }).finally(() => {
+    isProcessing = false;
+    if (extractSpinner) extractSpinner.style.display = 'none';
+    updateExtractButton();
+  });
+}
+
+function onDownloadDaily() {
+  if (!validateCashTpe()) return;
+  downloadDailyExcel();
+}
+
+function onDownloadWeekly() {
+  if (isDownloading) return;
+  if (!validateCashTpe()) return;
+  isDownloading = true;
+  downloadWeeklyExcel().then(() => { isDownloading = false; });
+}
+
+async function processAllFiles() {
+  for (const f of pdfFiles) {
+    try {
+      await processPdf(f);
+    } catch (err) {
+      console.error('Failed to process', f.name, err);
+      f.processed = true;
+      f.entries = f.entries || [];
+    }
+  }
+}
+
+window.processSingle = async function(tabIndex) {
+  if (!libsReady) { alert('Please wait for pdf.js to load'); return; }
+  const f = pdfFiles[tabIndex];
+  isProcessing = true;
+  renderTabs();
+  try {
+    await processPdf(f);
+  } catch (err) {
+    console.error(err);
+    showToast('error', 'Processing failed', err.message);
+  } finally {
+    isProcessing = false;
+    renderFileList();
+    renderTabs();
+    updateStats();
+  }
+};
+
+async function processPdf(f) {
+  const arrayBuffer = await f.file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+  const lines = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    lines.push(...clusterPdfLines(content.items));
+  }
+
+  const fullText = `${lines.join('\n')}\n${lines.join(' ')}`;
+  console.log('PDF extracted lines:', lines.length);
+  console.log('PDF extracted text preview:', fullText.substring(0, 800));
+
+  f.entries = parseTableText(fullText, f.day, f.month, f.year, f.name);
+  console.log('PDF entries found:', f.entries.length, f.name);
+  f.processed = true;
+}
+
+function clusterPdfLines(items, yTolerance = 3.5) {
+  const usable = (items || []).filter(it => it && typeof it.str === 'string' && it.str.length);
+  const rows = [];
+
+  const sorted = usable.slice().sort((a, b) => {
+    const ay = a.transform?.[5] || 0;
+    const by = b.transform?.[5] || 0;
+    if (Math.abs(ay - by) > yTolerance) return by - ay;
+    return (a.transform?.[4] || 0) - (b.transform?.[4] || 0);
+  });
+
+  for (const it of sorted) {
+    const y = it.transform?.[5] || 0;
+    const x = it.transform?.[4] || 0;
+    const width = typeof it.width === 'number' ? it.width : Math.max(it.str.length * 4, 2);
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(last.y - y) <= yTolerance) {
+      last.cells.push({ x, width, str: it.str, hasEOL: !!it.hasEOL });
+    } else {
+      rows.push({ y, cells: [{ x, width, str: it.str, hasEOL: !!it.hasEOL }] });
+    }
+  }
+
+  return rows.map(row => joinRowCells(row.cells)).filter(Boolean);
+}
+
+function joinRowCells(cells) {
+  const sorted = cells.slice().sort((a, b) => a.x - b.x);
+  let out = '';
+  let prevRight = null;
+  for (const cell of sorted) {
+    if (prevRight != null) {
+      const gap = cell.x - prevRight;
+      out += gap > 2.2 ? ' ' : '';
+    }
+    out += cell.str;
+    prevRight = cell.x + (cell.width || 0);
+  }
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+function parseMoneyToken(raw) {
+  if (raw == null) return NaN;
+  let cleaned = String(raw).replace(/\s/g, '').replace(/[^\d,.\-]/g, '');
+  if (!cleaned || cleaned === '-' || cleaned === '.' || cleaned === ',') return NaN;
+
+  const lastDot = cleaned.lastIndexOf('.');
+  const lastComma = cleaned.lastIndexOf(',');
+  let normalized = cleaned;
+
+  if (lastDot !== -1 && lastComma !== -1) {
+    if (lastComma > lastDot) {
+      normalized = cleaned.replace(/\./g, '').replace(',', '.');
+    } else {
+      normalized = cleaned.replace(/,/g, '');
+    }
+  } else if (lastComma !== -1) {
+    const frac = cleaned.length - lastComma - 1;
+    normalized = frac <= 3 ? cleaned.replace(',', '.') : cleaned.replace(/,/g, '');
+  } else if (lastDot !== -1) {
+    const frac = cleaned.length - lastDot - 1;
+    if (frac === 3 && (cleaned.match(/\./g) || []).length > 1) {
+      normalized = cleaned.replace(/\./g, '');
+    }
+  }
+
+  const num = parseFloat(normalized);
+  return Number.isFinite(num) ? num : NaN;
+}
+
+const TX_TYPE_LABELS = [
+  'Member Transactions',
+  'Computer Incomes',
+  'Playstation Incomes',
+  'Order Incomes',
+  'Co-working',
+  'PASS EVENEMENT',
+  'Discounts',
+];
+
+const TX_TYPE_RE = new RegExp(`^(${TX_TYPE_LABELS.map(l => l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`, 'i');
+const KNOWN_COMMENT_RE = /money deposited to member account\.?/i;
+
+function stripStrayTail(text) {
+  return (text || '')
+    .replace(/\s+[A-Za-z][\w.-]*\s+\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?.*$/, '')
+    .replace(/\s+\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?.*$/, '')
+    .replace(/^[A-Za-z][\w.-]*\s+\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?.*$/, '')
+    .trim();
+}
+
+function isUsefulComment(text) {
+  const t = (text || '').trim();
+  if (!t) return false;
+  if (KNOWN_COMMENT_RE.test(t)) return true;
+  if (/^GAMEFY/i.test(t) || /^PS\d/i.test(t)) return true;
+  if (/\d{1,2}[./-]\d{1,2}[./-]\d{2,4}/.test(t)) return false;
+  if (/\d{1,2}:\d{2}(?::\d{2})?/.test(t)) return false;
+  if (/\bpage\s*\d/i.test(t)) return false;
+  if (/^(cashier|reports?|filter status|showing page)\b/i.test(t)) return false;
+  if (/^[A-Za-z][\w.-]*\d[\w.-]*$/.test(t)) return false;
+  return true;
+}
+
+function takeKnownComment(text) {
+  const m = (text || '').match(KNOWN_COMMENT_RE);
+  return m ? m[0].replace(/\.$/, '').trim() : '';
+}
+
+function splitTypeAndComment(description, afterAmount) {
+  let desc = stripStrayTail((description || '').replace(/\s+/g, ' '));
+  let comment = stripStrayTail((afterAmount || '').replace(/\s+/g, ' '));
+
+  const typeMatch = desc.match(TX_TYPE_RE);
+  let extra = '';
+  if (typeMatch) {
+    extra = desc.slice(typeMatch[0].length).replace(/^[\s.:\-–—]+/, '').trim();
+    desc = typeMatch[1];
+  }
+
+  const fromExtra = takeKnownComment(extra);
+  if (fromExtra) {
+    comment = fromExtra;
+    extra = extra.replace(KNOWN_COMMENT_RE, '').trim();
+  } else if (extra && isUsefulComment(extra) && !comment) {
+    comment = extra;
+    extra = '';
+  } else if (extra) {
+    desc = `${desc} ${extra}`.trim();
+  }
+
+  const fromComment = takeKnownComment(comment);
+  if (fromComment) comment = fromComment;
+  else if (!isUsefulComment(comment)) comment = '';
+
+  if (!comment) {
+    const fromDesc = takeKnownComment(desc);
+    if (fromDesc) {
+      comment = fromDesc;
+      desc = desc.replace(KNOWN_COMMENT_RE, '').replace(/\s+/g, ' ').trim();
+    }
+  }
+
+  return {
+    description: desc.replace(/\s+/g, ' ').trim(),
+    comment: comment.replace(/\s+/g, ' ').trim(),
+  };
+}
+
+function cutAtNextStamp(body) {
+  const re = /\s+(?:taktek\s+)?\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?\s+(?:Income|Expense|Recette|D[ée]pense)\b/i;
+  const m = body.match(re);
+  if (m && m.index > 0) return body.slice(0, m.index).trim();
+  return body;
+}
+
+function isJunkDescription(description, comment, amount) {
+  const t = `${description} ${comment}`.toLowerCase().trim();
+  if (!t) return true;
+  if (/^(page|reports?|cashier|date|income\/expense|payment method|transaction type|amount|comment|filter status|report result)\b/.test(t)) return true;
+  if (/\bpage\s*\d+\s*\/\s*\d+\b/.test(t)) return true;
+  if (/^reports?\b/.test(t) && amount >= 1900 && amount <= 2100) return true;
+  return false;
+}
+
+function formatIsoDate(d, m, y) {
+  let year = parseInt(y, 10);
+  if (year < 100) year += 2000;
+  const day = parseInt(d, 10);
+  const month = parseInt(m, 10);
+  if (day < 1 || day > 31 || month < 1 || month > 12) return null;
+  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function extractBalancedParen(text) {
+  const start = text.indexOf('(');
+  if (start === -1) return null;
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === '(') depth++;
+    else if (text[i] === ')') {
+      depth--;
+      if (depth === 0) {
+        return {
+          before: text.slice(0, start).trim(),
+          inner: text.slice(start + 1, i).trim(),
+          after: text.slice(i + 1).trim(),
+        };
+      }
+    }
+  }
+  return {
+    before: text.slice(0, start).trim(),
+    inner: text.slice(start + 1).replace(/\)+$/, '').trim(),
+    after: '',
+  };
+}
+
+function findAmountSplit(body) {
+  const tndRe = /(-?\d{1,3}(?:[.\s]\d{3})*(?:[.,]\d{1,3})|-?\d+[.,]\d{1,3}|-?\d+)\s*(?:TND|DT)\b/gi;
+  const tndHits = [...body.matchAll(tndRe)];
+  if (tndHits.length) {
+    const m = tndHits[tndHits.length - 1];
+    return { amount: parseMoneyToken(m[1]), index: m.index, length: m[0].length };
+  }
+
+  const decRe = /(-?\d{1,3}(?:[.\s]\d{3})*[.,]\d{2,3}|-?\d+[.,]\d{2,3})\b/g;
+  const decHits = [...body.matchAll(decRe)];
+  if (decHits.length) {
+    const m = decHits[decHits.length - 1];
+    return { amount: parseMoneyToken(m[1]), index: m.index, length: m[0].length };
+  }
+
+  return null;
+}
+
+function parseTaktekRows(text, fileDate) {
+  const startRe = /(?:taktek\s+)?(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+(Income|Expense|Recette|D[ée]pense)\b/gi;
+  const starts = [];
+  let match;
+  while ((match = startRe.exec(text)) !== null) {
+    starts.push({
+      index: match.index,
+      date: formatIsoDate(match[1], match[2], match[3]) || fileDate,
+      typeRaw: match[5],
+      after: match.index + match[0].length,
+    });
+  }
+
+  const rows = [];
+  for (let i = 0; i < starts.length; i++) {
+    const start = starts[i];
+    const end = i + 1 < starts.length ? starts[i + 1].index : text.length;
+    let body = text.slice(start.after, end).replace(/\s+/g, ' ').trim();
+    body = cutAtNextStamp(body);
+    body = body.replace(/\s*Page\s*\d+\s*\/\s*\d+.*$/i, '').trim();
+    body = body.replace(/\s*(?:Cashier|Filter Status|Report Result|Reports|Showing page|Income\/Expense|Payment Method|Transaction Type)\b.*$/i, '').trim();
+
+    const pay = body.match(/^(Cash|Credit Card|Debit Card|TPE|Esp[eè]ces|Carte)\s+/i);
+    if (pay) body = body.slice(pay[0].length).trim();
+
+    const split = findAmountSplit(body);
+    if (!split || !Number.isFinite(split.amount)) continue;
+
+    let description = body.slice(0, split.index).replace(/^taktek\s+/i, '').trim();
+    let afterAmount = body.slice(split.index + split.length).replace(/^taktek\s+/i, '').trim();
+    let comment = '';
+
+    const paren = extractBalancedParen(afterAmount);
+    if (paren) {
+      comment = paren.inner;
+      afterAmount = [paren.before, paren.after].filter(Boolean).join(' ').trim();
+      if (paren.before) description = `${description} ${paren.before}`.trim();
+    } else {
+      comment = afterAmount;
+      afterAmount = '';
+    }
+
+    const cleaned = splitTypeAndComment(description.replace(/\bTND\b/ig, ''), comment);
+    description = cleaned.description;
+    comment = cleaned.comment;
+
+    const type = /expense|d[ée]pense|sortie/i.test(start.typeRaw) ? 'expense' : 'income';
+    if (isJunkDescription(description, comment, split.amount)) continue;
+
+    rows.push({
+      date: start.date,
+      type,
+      description: description || 'Entry',
+      comment,
+      amount: split.amount,
+    });
+  }
+  return rows;
+}
+
+function parseTableText(text, day, month, year, sourceFile) {
+  const fileDate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const entries = [];
+
+  const pushEntry = (partial) => {
+    if (!partial) return;
+    const type = partial.type || 'income';
+    let amount = Number(partial.amount);
+    if (!Number.isFinite(amount)) return;
+    amount = Math.round(Math.abs(amount) * 100) / 100;
+    amount = type === 'expense' ? -amount : amount;
+    let description = (partial.description || '').replace(/\s+/g, ' ').trim();
+    if (!description) description = 'Entry';
+    if (isJunkDescription(description, partial.comment, Math.abs(amount))) return;
+    entries.push({
+      id: crypto.randomUUID?.() ?? `${day}-${month}-${Math.random()}`,
+      date: partial.date || fileDate,
+      type,
+      description,
+      comment: (partial.comment || '').trim(),
+      amount,
+      sourceFile,
+    });
+  };
+
+  for (const row of parseTaktekRows(text, fileDate)) pushEntry(row);
+
+  const seen = new Set();
+  return entries.filter(e => {
+    const k = `${e.date}|${e.type}|${e.description}|${e.comment}|${e.amount}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Grid actions
+// ---------------------------------------------------------------------------
+window.addRow = function(tabIndex) {
+  const f = pdfFiles[tabIndex];
+  if (!f) return;
+  const d = `${f.year}-${String(f.month).padStart(2, '0')}-${String(f.day).padStart(2, '0')}`;
+  f.entries.push({
+    id: crypto.randomUUID?.() ?? Math.random().toString(),
+    date: d, type: 'expense', description: '', comment: '', amount: 0, sourceFile: f.name,
+  });
+  initSpreadsheet(tabIndex);
+  updateStats();
+};
+
+window.deleteLastRow = function(tabIndex) {
+  const f = pdfFiles[tabIndex];
+  if (!f || f.entries.length === 0) return;
+  f.entries.pop();
+  initSpreadsheet(tabIndex);
+  updateStats();
+};
+
+// ---------------------------------------------------------------------------
+// Week grouping
+// ---------------------------------------------------------------------------
+function weekOfMonth(day) {
+  return Math.ceil(day / 7);
+}
+
+function getAllEntries() {
+  const all = [];
+  for (const f of pdfFiles) {
+    for (const e of f.entries) {
+      all.push({ ...e, sourceFile: f.name });
+    }
+  }
+  return all;
+}
+
+function groupByWeek() {
+  const weeks = new Map();
+  for (const e of getAllEntries()) {
+    const d = new Date(e.date);
+    if (isNaN(d.getTime())) continue;
+    const wk = weekOfMonth(d.getDate());
+    if (!weeks.has(wk)) weeks.set(wk, []);
+    weeks.get(wk).push(e);
+  }
+  return weeks;
+}
+
+function categorize(description) {
+  const desc = description.toLowerCase();
+  for (const cat of CATEGORIES) {
+    for (const kw of cat.keywords) {
+      if (desc.includes(kw)) return cat.label;
+    }
+  }
+  return 'Other';
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation helpers
+// ---------------------------------------------------------------------------
+function totalAmounts(f) {
+  return f.entries.reduce((s, e) => s + e.amount, 0);
+}
+function totalIncome(f) {
+  return f.entries.filter(e => e.type === 'income').reduce((s, e) => s + Math.abs(e.amount), 0);
+}
+function totalExpense(f) {
+  return f.entries.filter(e => e.type === 'expense').reduce((s, e) => s + Math.abs(e.amount), 0);
+}
+function difference(f) {
+  const total = totalAmounts(f);
+  const cash = f.cashAmount || 0;
+  const tpe = f.tpeAmount || 0;
+  return (cash + tpe) - total;
+}
+
+// ---------------------------------------------------------------------------
+// Excel export: Daily (one sheet per day/file)
+// ---------------------------------------------------------------------------
+function downloadDailyExcel() {
+  if (!pdfFiles.length) { alert('Nothing to export'); return; }
+
+  const wb = XLSX.utils.book_new();
+
+  for (const f of pdfFiles) {
+    const rows = [['#', 'Date', 'Type', 'Description', 'Comment', 'Amount', 'Source File']];
+    f.entries.forEach((e, i) => {
+      rows.push([
+        i + 1,
+        e.date,
+        e.type.charAt(0).toUpperCase() + e.type.slice(1),
+        e.description,
+        e.comment || '',
+        e.type === 'income' ? +e.amount : -e.amount,
+        e.sourceFile,
+      ]);
+    });
+    rows.push(['', '', '', 'Total Amounts', '', totalAmounts(f), '']);
+    rows.push(['', '', '', 'Total Cash', '', f.cashAmount || 0, '']);
+    rows.push(['', '', '', 'Total TPE', '', f.tpeAmount || 0, '']);
+    rows.push(['', '', '', 'Difference', '', difference(f), '']);
+
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws['!cols'] = [
+      { width: 5 }, { width: 12 }, { width: 10 }, { width: 38 }, { width: 20 }, { width: 14 }, { width: 15 },
+    ];
+    XLSX.utils.book_append_sheet(wb, ws, `Day ${f.day}-${f.month}`);
+  }
+
+  const fname = `Gamefy_Daily_Invoices_Month${currentYear}.xlsx`;
+  XLSX.writeFile(wb, fname);
+  alert('Downloaded: ' + fname);
+}
+
+// ---------------------------------------------------------------------------
+// Excel export: Weekly (one sheet per week with all rows + accounting summary below)
+// ---------------------------------------------------------------------------
+function downloadWeeklyExcel() {
+  if (!pdfFiles.length) { alert('Nothing to export'); return; }
+
+  const weeks = groupByWeek();
+  if (weeks.size === 0) { alert('No data to export'); return; }
+
+  const wb = XLSX.utils.book_new();
+
+  const weekNums = Array.from(weeks.keys()).sort((a, b) => a - b);
+  const addedSheets = new Set();
+
+  for (const wk of weekNums) {
+    const sheetName = `Week ${wk}`;
+    if (addedSheets.has(sheetName)) continue;
+    addedSheets.add(sheetName);
+    const entries = weeks.get(wk);
+    const startDay = (wk - 1) * 7 + 1;
+    const endDay = Math.min(wk * 7, 31);
+    const weekTitle = `Vente ${wk}ème semaine`;
+
+    // Categorize entries (income only)
+    const catTotals = {};
+    for (const cat of CATEGORIES) catTotals[cat.label] = 0;
+    catTotals['Other'] = 0;
+
+    let totalIncome = 0;
+    let totalExpense = 0;
+
+    for (const e of entries) {
+      if (e.type === 'income') totalIncome += Math.abs(e.amount);
+      else totalExpense += Math.abs(e.amount);
+
+      if (e.type === 'income') {
+        const cat = categorize(e.description);
+        if (catTotals[cat] !== undefined) {
+          catTotals[cat] += Math.abs(e.amount);
+        } else {
+          catTotals['Other'] += Math.abs(e.amount);
+        }
+      }
+    }
+
+    const totalHT = totalIncome - totalExpense;
+
+    // Compute weekly Cash/TPE from all source files that have entries in this week
+    const weekSourceFiles = new Set(entries.map(e => e.sourceFile));
+    let weekCash = 0;
+    let weekTpe = 0;
+    for (const f of pdfFiles) {
+      if (weekSourceFiles.has(f.name)) {
+        weekCash += f.cashAmount || 0;
+        weekTpe += f.tpeAmount || 0;
+      }
+    }
+
+    // Build sheet rows
+    const rows = [];
+
+    // Title section
+    rows.push([weekTitle, '', '', '', '', '', '']);
+    rows.push(['Days ' + startDay + ' to ' + endDay, '', '', '', '', '', '']);
+    rows.push(['', '', '', '', '', '', '']);
+
+    // Main data table header
+    rows.push(['#', 'Date', 'Type', 'Description', 'Comment', 'Amount', 'Source File']);
+
+    // All entries for this week (merged from all days)
+    let rowNum = 1;
+    for (const e of entries) {
+      rows.push([
+        rowNum++,
+        e.date,
+        e.type.charAt(0).toUpperCase() + e.type.slice(1),
+        e.description,
+        e.comment || '',
+        e.type === 'income' ? Math.abs(e.amount) : -Math.abs(e.amount),
+        e.sourceFile,
+      ]);
+    }
+
+    // Empty row separator
+    rows.push(['', '', '', '', '', '', '']);
+
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+
+    ws['!cols'] = [
+      { width: 8 },
+      { width: 12 },
+      { width: 12 },
+      { width: 40 },
+      { width: 20 },
+      { width: 14 },
+      { width: 20 },
+    ];
+
+    XLSX.utils.book_append_sheet(wb, ws, `Week ${wk}`);
+  }
+
+  const fname = `Gamefy_Weekly_Invoices_Month${currentYear}.xlsx`;
+  XLSX.writeFile(wb, fname);
+  alert('Downloaded: ' + fname);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function escapeHtml(t) {
+  if (t == null) return '';
+  return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function formatMoney(n) {
+  const v = Number(n) || 0;
+  return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+window.app = {
+  removeFile, processSingle, addRow, deleteLastRow, updateCashTpe, saveCashTpe,
+};
+

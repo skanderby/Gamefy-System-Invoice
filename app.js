@@ -8,8 +8,26 @@
  * - Download Weekly Excel (all rows per week + accounting summary)
  */
 
-import * as pdfjsLib from './assets/pdfjs/pdf.js';
-pdfjsLib.GlobalWorkerOptions.workerSrc = './assets/pdfjs/pdf.worker.js';
+let pdfjsLib;
+
+function loadPdfJS() {
+  return new Promise((resolve, reject) => {
+    if (window.pdfjsLib) {
+      pdfjsLib = window.pdfjsLib;
+      resolve();
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = 'https://unpkg.com/pdfjs-dist@4.8.69/build/pdf.min.js';
+    s.onload = () => {
+      pdfjsLib = window.pdfjsLib;
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@4.8.69/build/pdf.worker.min.js';
+      resolve();
+    };
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -19,6 +37,7 @@ let spreadsheetInstances = {}; // tabIndex -> jspreadsheet instance
 let currentYear = new Date().getFullYear();
 let libsReady = false;
 let isProcessing = false;
+let isDownloading = false;
 let activeTabIndex = 0;
 let isUploadCollapsed = false;
 
@@ -26,8 +45,8 @@ const EXCEL_COLS = [
   { key: 'rowNum', label: '#', width: 50 },
   { key: 'date', label: 'Date', width: 110 },
   { key: 'type', label: 'Type', width: 100 },
-  { key: 'description', label: 'Description', width: 260 },
-  { key: 'comment', label: 'Comment', width: 260 },
+  { key: 'description', label: 'Description', width: 200 },
+  { key: 'comment', label: 'Comment', width: 200 },
   { key: 'amount', label: 'Amount', width: 120 },
   { key: 'sourceFile', label: 'Source File', width: 150 },
 ];
@@ -46,33 +65,12 @@ const CATEGORIES = [
 // ---------------------------------------------------------------------------
 let dropZone, fileInput, browseLink, fileList, btnExtract, extractSpinner;
 let stepDrop, stepTabs, tabsHeader, tabsPanels, btnMoreFiles, btnDownloadDaily, btnDownloadWeekly;
-let statsFiles, statsEntries, btnCollapseUpload, btnExpandUpload, collapsedSummaryText;
-
-function initDOM() {
-  dropZone = document.getElementById('dropZone');
-  fileInput = document.getElementById('fileInput');
-  browseLink = document.getElementById('browseLink');
-  fileList = document.getElementById('fileList');
-  btnExtract = document.getElementById('btnExtract');
-  extractSpinner = document.getElementById('extractSpinner');
-  stepDrop = document.getElementById('step-drop');
-  stepTabs = document.getElementById('step-tabs');
-  tabsHeader = document.getElementById('tabsHeader');
-  tabsPanels = document.getElementById('tabsPanels');
-  btnMoreFiles = document.getElementById('btnMoreFiles');
-  btnDownloadDaily = document.getElementById('btnDownloadDaily');
-  btnDownloadWeekly = document.getElementById('btnDownloadWeekly');
-  statsFiles = document.getElementById('stats-files');
-  statsEntries = document.getElementById('stats-entries');
-  btnCollapseUpload = document.getElementById('btnCollapseUpload');
-  btnExpandUpload = document.getElementById('btnExpandUpload');
-  collapsedSummaryText = document.getElementById('collapsedSummaryText');
-}
+let statsFiles, statsEntries, collapseToggle;
 
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
   initDOM();
   setupDragDrop();
   setupFileInput();
@@ -80,37 +78,37 @@ window.addEventListener('DOMContentLoaded', () => {
   setupCollapseToggle();
   updateStats();
   updateDownloadButtons();
-  updateExtractButton();
-  setUploadCollapsed(false);
-  libsReady = true;
-  console.log('Libs ready, pdfjsLib:', typeof pdfjsLib, 'jspreadsheet:', typeof jspreadsheet);
+
+  try {
+    await loadPdfJS();
+    libsReady = true;
+    console.log('pdf.js loaded:', typeof pdfjsLib);
+  } catch (e) {
+    console.error('pdf.js load failed:', e);
+    showToast('error', 'Library load failed', 'pdf.js did not load. Refresh the page.');
+  }
+  if (btnExtract) btnExtract.disabled = false;
 });
 
 // ---------------------------------------------------------------------------
 // Collapse / Expand toggle
 // ---------------------------------------------------------------------------
 function setupCollapseToggle() {
-  if (btnCollapseUpload) btnCollapseUpload.addEventListener('click', () => setUploadCollapsed(true));
-  if (btnExpandUpload) btnExpandUpload.addEventListener('click', () => setUploadCollapsed(false));
-}
-
-function setUploadCollapsed(collapsed) {
-  isUploadCollapsed = collapsed;
-  if (!stepDrop) return;
-  stepDrop.classList.toggle('collapsed', collapsed);
-  if (btnCollapseUpload) {
-    btnCollapseUpload.style.display = collapsed || pdfFiles.length === 0 ? 'none' : '';
-  }
-  updateCollapsedSummary();
-}
-
-function updateCollapsedSummary() {
-  if (!collapsedSummaryText) return;
-  const total = pdfFiles.reduce((s, f) => s + (f.entries?.length || 0), 0);
-  const noTable = pdfFiles.filter(f => f.processed && !f.entries.length).length;
-  const parts = [`${pdfFiles.length} PDF${pdfFiles.length === 1 ? '' : 's'}`, `${total} entr${total === 1 ? 'y' : 'ies'}`];
-  if (noTable) parts.push(`${noTable} without a table`);
-  collapsedSummaryText.textContent = parts.join(' · ');
+  if (!collapseToggle || !stepDrop) return;
+  collapseToggle.addEventListener('click', () => {
+    isCollapsed = !isCollapsed;
+    if (isCollapsed) {
+      stepDrop.style.display = 'none';
+      collapseToggle.textContent = 'Expand';
+      collapseToggle.classList.add('btn-primary');
+      collapseToggle.classList.remove('btn-secondary');
+    } else {
+      stepDrop.style.display = 'block';
+      collapseToggle.textContent = 'Collapse';
+      collapseToggle.classList.remove('btn-primary');
+      collapseToggle.classList.add('btn-secondary');
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -128,10 +126,6 @@ function setupDragDrop() {
     const files = Array.from(e.dataTransfer.files).filter(f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
     addFiles(files);
   });
-  dropZone.addEventListener('click', e => {
-    if (e.target.closest('a, button, input')) return;
-    if (fileInput) fileInput.click();
-  });
 }
 
 function setupFileInput() {
@@ -148,8 +142,8 @@ function setupButtons() {
   if (btnDownloadDaily) btnDownloadDaily.addEventListener('click', onDownloadDaily);
   if (btnDownloadWeekly) btnDownloadWeekly.addEventListener('click', onDownloadWeekly);
   if (btnMoreFiles) btnMoreFiles.addEventListener('click', () => {
-    setUploadCollapsed(false);
-    if (stepDrop) stepDrop.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (stepDrop) stepDrop.style.display = 'block';
+    if (stepTabs) stepTabs.style.display = 'none';
   });
 }
 
@@ -170,10 +164,6 @@ function updateDownloadButtons() {
   const allFilled = pdfFiles.every(f => (f.cashAmount || 0) > 0 || (f.tpeAmount || 0) > 0);
   if (btnDownloadDaily) btnDownloadDaily.disabled = !allFilled || pdfFiles.length === 0;
   if (btnDownloadWeekly) btnDownloadWeekly.disabled = !allFilled || pdfFiles.length === 0;
-}
-
-function updateExtractButton() {
-  if (btnExtract) btnExtract.disabled = pdfFiles.length === 0 || isProcessing;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,8 +210,8 @@ function addFiles(files) {
   renderFileList();
   updateStats();
   updateDownloadButtons();
-  updateExtractButton();
-  setUploadCollapsed(false);
+  if (stepDrop) stepDrop.style.display = 'block';
+  if (stepTabs) stepTabs.style.display = 'none';
 }
 
 function removeFile(index) {
@@ -233,8 +223,8 @@ function removeFile(index) {
   }
   pdfFiles.splice(index, 1);
   if (pdfFiles.length === 0) {
-    setUploadCollapsed(false);
-    if (stepTabs) stepTabs.hidden = true;
+    if (stepDrop) stepDrop.style.display = 'block';
+    if (stepTabs) stepTabs.style.display = 'none';
     activeTabIndex = 0;
   } else {
     if (activeTabIndex >= pdfFiles.length) activeTabIndex = pdfFiles.length - 1;
@@ -242,7 +232,6 @@ function removeFile(index) {
   }
   updateStats();
   updateDownloadButtons();
-  updateExtractButton();
 }
 
 function parseDayMonth(name) {
@@ -266,9 +255,11 @@ function renderFileList() {
         <span class="file-badge ${statusClass}">${status}</span>
       </div>
       <div class="file-meta">
-        <span>${f.day}/${f.month}</span>
+        <span class="meta-item"><i class="fa-solid fa-calendar"></i> Day ${f.day}</span>
+        <span class="meta-item"><i class="fa-solid fa-calendar-days"></i> Month ${f.month}</span>
+        <span class="meta-item"><i class="fa-solid fa-list"></i> ${f.entries.length}</span>
       </div>
-      <button class="btn btn-danger btn-sm" onclick="window.app.removeFile(${i})">Remove</button>
+      <button class="btn btn-secondary btn-sm" onclick="window.app.removeFile(${i})">Remove</button>
     `;
     fileList.appendChild(card);
   }
@@ -279,7 +270,6 @@ function updateStats() {
   statsFiles.textContent = pdfFiles.length;
   const totalEntries = pdfFiles.reduce((s, f) => s + f.entries.length, 0);
   statsEntries.textContent = totalEntries;
-  updateCollapsedSummary();
 }
 
 // ---------------------------------------------------------------------------
@@ -299,52 +289,55 @@ function renderTabs() {
 
     const tabBtn = document.createElement('button');
     tabBtn.className = 'tab-btn' + (isActive ? ' active' : '');
-    tabBtn.textContent = `${f.day}/${f.month}`;
+    tabBtn.textContent = `${f.name} (${f.day}/${f.month})`;
     tabBtn.onclick = () => { activeTabIndex = i; renderTabs(); initSpreadsheet(i); };
     tabsHeader.appendChild(tabBtn);
 
     const panel = document.createElement('div');
     panel.className = 'tab-panel' + (isActive ? ' active' : '');
     if (!isActive) panel.style.display = 'none';
-    const chipClass = f.processed ? (f.entries.length ? 'status-ok' : 'status-warn') : 'status-info';
-    const chipText = f.processed ? (f.entries.length ? f.entries.length + ' rows' : 'No table') : 'Pending';
     panel.innerHTML = `
       <div class="file-tab-card">
         <div class="file-tab-actions">
-          <button class="btn btn-ghost btn-sm" onclick="window.app.processSingle(${i})" ${isProcessing ? 'disabled' : ''}>
-            <span class="spinner" style="display:${isProcessing ? 'inline-block' : 'none'};"></span>
-            ${isProcessing ? 'Working…' : 'Re-extract'}
+          <button class="btn btn-secondary btn-sm" onclick="window.app.processSingle(${i})" ${isProcessing ? 'disabled' : ''}>
+            <span class="spinner" style="display:${isProcessing ? 'inline-block' : 'none'};margin-right:6px;"></span>
+            ${isProcessing ? 'Processing...' : '🔄 Re-process'}
           </button>
-          <button class="btn btn-ghost btn-sm" onclick="window.app.addRow(${i})">Add row</button>
-          <button class="btn btn-ghost btn-sm" onclick="window.app.deleteLastRow(${i})">Delete last</button>
-          <span class="entry-chip file-badge ${chipClass}">${chipText}</span>
+          <button class="btn btn-secondary btn-sm" onclick="window.app.addRow(${i})">➕ Add row</button>
+          <button class="btn btn-secondary btn-sm" onclick="window.app.deleteLastRow(${i})">🗑️ Delete last</button>
+          <span class="p-chip" style="background:${f.processed ? '#eef2f7' : '#fef3c7'}; color:${f.processed ? '#2563eb' : '#92400e'}; font-weight:700;">
+            ${f.processed ? '✓ ' + f.entries.length + ' entries' : '⚠ Not processed'}
+          </span>
         </div>
         <div id="spreadsheet-${i}" class="spreadsheet-container">
-          <div class="spreadsheet-loading">Opening table…</div>
+          <div class="spreadsheet-loading"><i class="fa-solid fa-spinner fa-spin"></i><p>Loading Excel editor...</p></div>
         </div>
         <div class="reconciliation-card">
-          <h3 class="recon-title">Reconciliation</h3>
+          <h3 class="recon-title">Daily Reconciliation</h3>
           <div class="recon-grid">
             <div class="recon-item income-item">
-              <div class="recon-label">Total</div>
+              <div class="recon-label">Total Amounts</div>
               <div class="recon-value total" id="total-amounts-${i}">0.00</div>
             </div>
             <div class="recon-item cash-item">
-              <div class="recon-label">Cash</div>
+              <div class="recon-label">Total Cash</div>
               <input type="number" id="cash-${i}" min="0" step="0.01" value="${f.cashAmount || 0}" class="recon-input" onchange="window.app.updateCashTpe(${i})" />
             </div>
             <div class="recon-item tpe-item">
-              <div class="recon-label">TPE</div>
+              <div class="recon-label">Total TPE</div>
               <input type="number" id="tpe-${i}" min="0" step="0.01" value="${f.tpeAmount || 0}" class="recon-input" onchange="window.app.updateCashTpe(${i})" />
             </div>
             <div class="recon-item difference-item">
               <div class="recon-label">Difference</div>
               <div class="recon-value difference" id="diff-${i}">0.00</div>
             </div>
+            <div class="recon-item save-item">
+              <button class="btn btn-primary btn-sm" onclick="window.app.saveCashTpe(${i})" id="save-btn-${i}">
+                <i class="fa-solid fa-save"></i> Save
+              </button>
+            </div>
           </div>
-          <div class="recon-item save-item">
-            <button class="btn btn-primary btn-sm" onclick="window.app.saveCashTpe(${i})" id="save-btn-${i}">Save</button>
-          </div>
+          <p class="recon-note">Difference = Total Amounts − (Total Cash + Total TPE)</p>
         </div>
       </div>
     `;
@@ -373,15 +366,14 @@ function initSpreadsheet(tabIndex) {
     { type: 'text', title: '#', width: 50, readonly: true },
     { type: 'text', title: 'Date', width: 110 },
     { type: 'dropdown', title: 'Type', width: 100, source: ['Income', 'Expense'] },
-    { type: 'text', title: 'Description', width: 260, wordWrap: true },
-    { type: 'text', title: 'Comment', width: 260, wordWrap: true },
-    { type: 'numeric', title: 'Amount', width: 120, align: 'right', mask: '#,##0.00' },
+    { type: 'text', title: 'Description', width: 200 },
+    { type: 'text', title: 'Comment', width: 200 },
+    { type: 'number', title: 'Amount', width: 120, align: 'right' },
     { type: 'text', title: 'Source File', width: 150, readonly: true },
   ];
 
   const entries = f.entries || [];
 
-  // Ensure we always have at least one row for jspreadsheet
   let data;
   if (entries.length === 0) {
     data = [[
@@ -414,8 +406,7 @@ function initSpreadsheet(tabIndex) {
       pagination: 25,
       tableOverflow: true,
       tableWidth: '100%',
-      tableHeight: '480px',
-      wordWrap: true,
+      tableHeight: '420px',
       onchange: (worksheet, cell, x, y, value) => {
         handleSpreadsheetChange(tabIndex, y, x, value);
       },
@@ -500,28 +491,18 @@ function onExtractClick() {
   isProcessing = true;
   if (btnExtract) { btnExtract.disabled = true; if (extractSpinner) extractSpinner.style.display = 'inline-block'; }
   processAllFiles().then(() => {
-    isProcessing = false;
-    const total = pdfFiles.reduce((s, f) => s + f.entries.length, 0);
-    const empty = pdfFiles.filter(f => !f.entries.length).length;
-    if (stepTabs) {
-      stepTabs.hidden = false;
-      stepTabs.style.display = '';
+    if (stepDrop) stepDrop.style.display = 'none';
+    if (stepTabs) stepTabs.style.display = 'block';
+    isCollapsed = true;
+    if (collapseToggle) {
+      collapseToggle.textContent = 'Expand';
+      collapseToggle.classList.add('btn-primary');
+      collapseToggle.classList.remove('btn-secondary');
     }
-    setUploadCollapsed(true);
-    renderFileList();
     renderTabs();
-    if (total) {
-      showToast('success', 'Extraction complete', `${total} row${total === 1 ? '' : 's'} from ${pdfFiles.length} PDF${pdfFiles.length === 1 ? '' : 's'}${empty ? ` · ${empty} without a table` : ''}`);
-    } else {
-      showToast('error', 'No table found', 'Could not detect income/expense rows. Re-process after checking the PDF has selectable text.');
-    }
-  }).catch(err => {
-    console.error(err);
-    showToast('error', 'Extraction failed', err.message || String(err));
   }).finally(() => {
     isProcessing = false;
-    if (extractSpinner) extractSpinner.style.display = 'none';
-    updateExtractButton();
+    if (btnExtract) { btnExtract.disabled = false; if (extractSpinner) extractSpinner.style.display = 'none'; }
   });
 }
 
@@ -531,37 +512,34 @@ function onDownloadDaily() {
 }
 
 function onDownloadWeekly() {
+  if (isDownloading) return;
   if (!validateCashTpe()) return;
-  downloadWeeklyExcel();
+  isDownloading = true;
+  downloadWeeklyExcel().then(() => { isDownloading = false; });
 }
 
 async function processAllFiles() {
   for (const f of pdfFiles) {
-    try {
-      await processPdf(f);
-    } catch (err) {
-      console.error('Failed to process', f.name, err);
-      f.processed = true;
-      f.entries = f.entries || [];
-    }
+    await processPdf(f);
   }
+  renderFileList();
+  renderTabs();
 }
 
 window.processSingle = async function(tabIndex) {
   if (!libsReady) { alert('Please wait for pdf.js to load'); return; }
   const f = pdfFiles[tabIndex];
   isProcessing = true;
-  renderTabs();
   try {
     await processPdf(f);
-  } catch (err) {
-    console.error(err);
-    showToast('error', 'Processing failed', err.message);
-  } finally {
-    isProcessing = false;
     renderFileList();
     renderTabs();
-    updateStats();
+    initSpreadsheet(tabIndex);
+  } catch (err) {
+    console.error(err);
+    alert('Processing failed: ' + err.message);
+  } finally {
+    isProcessing = false;
   }
 };
 
@@ -569,328 +547,85 @@ async function processPdf(f) {
   const arrayBuffer = await f.file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
 
-  const lines = [];
+  const allText = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    lines.push(...clusterPdfLines(content.items));
+    content.items.sort((a, b) => {
+      const ay = a.transform?.[5] || 0;
+      const by = b.transform?.[5] || 0;
+      if (Math.abs(ay - by) > 2) return by - ay;
+      return (a.transform?.[4] || 0) - (b.transform?.[4] || 0);
+    });
+    allText.push(content.items.map(it => it.str).join(' '));
   }
 
-  const fullText = `${lines.join('\n')}\n${lines.join(' ')}`;
-  console.log('PDF extracted lines:', lines.length);
-  console.log('PDF extracted text preview:', fullText.substring(0, 800));
+  const fullText = allText.join('\n');
+  console.log('PDF extracted text length:', fullText.length);
+  console.log('PDF extracted text preview:', fullText.substring(0, 500));
 
   f.entries = parseTableText(fullText, f.day, f.month, f.year, f.name);
-  console.log('PDF entries found:', f.entries.length, f.name);
+  console.log('PDF entries found:', f.entries.length);
   f.processed = true;
 }
 
-function clusterPdfLines(items, yTolerance = 3.5) {
-  const usable = (items || []).filter(it => it && typeof it.str === 'string' && it.str.length);
-  const rows = [];
-
-  const sorted = usable.slice().sort((a, b) => {
-    const ay = a.transform?.[5] || 0;
-    const by = b.transform?.[5] || 0;
-    if (Math.abs(ay - by) > yTolerance) return by - ay;
-    return (a.transform?.[4] || 0) - (b.transform?.[4] || 0);
-  });
-
-  for (const it of sorted) {
-    const y = it.transform?.[5] || 0;
-    const x = it.transform?.[4] || 0;
-    const width = typeof it.width === 'number' ? it.width : Math.max(it.str.length * 4, 2);
-    const last = rows[rows.length - 1];
-    if (last && Math.abs(last.y - y) <= yTolerance) {
-      last.cells.push({ x, width, str: it.str, hasEOL: !!it.hasEOL });
-    } else {
-      rows.push({ y, cells: [{ x, width, str: it.str, hasEOL: !!it.hasEOL }] });
-    }
-  }
-
-  return rows.map(row => joinRowCells(row.cells)).filter(Boolean);
-}
-
-function joinRowCells(cells) {
-  const sorted = cells.slice().sort((a, b) => a.x - b.x);
-  let out = '';
-  let prevRight = null;
-  for (const cell of sorted) {
-    if (prevRight != null) {
-      const gap = cell.x - prevRight;
-      out += gap > 2.2 ? ' ' : '';
-    }
-    out += cell.str;
-    prevRight = cell.x + (cell.width || 0);
-  }
-  return out.replace(/\s+/g, ' ').trim();
-}
-
-function parseMoneyToken(raw) {
-  if (raw == null) return NaN;
-  let cleaned = String(raw).replace(/\s/g, '').replace(/[^\d,.\-]/g, '');
-  if (!cleaned || cleaned === '-' || cleaned === '.' || cleaned === ',') return NaN;
-
-  const lastDot = cleaned.lastIndexOf('.');
-  const lastComma = cleaned.lastIndexOf(',');
-  let normalized = cleaned;
-
-  if (lastDot !== -1 && lastComma !== -1) {
-    if (lastComma > lastDot) {
-      normalized = cleaned.replace(/\./g, '').replace(',', '.');
-    } else {
-      normalized = cleaned.replace(/,/g, '');
-    }
-  } else if (lastComma !== -1) {
-    const frac = cleaned.length - lastComma - 1;
-    normalized = frac <= 3 ? cleaned.replace(',', '.') : cleaned.replace(/,/g, '');
-  } else if (lastDot !== -1) {
-    const frac = cleaned.length - lastDot - 1;
-    if (frac === 3 && (cleaned.match(/\./g) || []).length > 1) {
-      normalized = cleaned.replace(/\./g, '');
-    }
-  }
-
-  const num = parseFloat(normalized);
-  return Number.isFinite(num) ? num : NaN;
-}
-
-const TX_TYPE_LABELS = [
-  'Member Transactions',
-  'Computer Incomes',
-  'Playstation Incomes',
-  'Order Incomes',
-  'Co-working',
-  'PASS EVENEMENT',
-  'Discounts',
-];
-
-const TX_TYPE_RE = new RegExp(`^(${TX_TYPE_LABELS.map(l => l.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`, 'i');
-const KNOWN_COMMENT_RE = /money deposited to member account\.?/i;
-
-function stripStrayTail(text) {
-  return (text || '')
-    .replace(/\s+[A-Za-z][\w.-]*\s+\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?.*$/, '')
-    .replace(/\s+\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?.*$/, '')
-    .replace(/^[A-Za-z][\w.-]*\s+\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?.*$/, '')
-    .trim();
-}
-
-function isUsefulComment(text) {
-  const t = (text || '').trim();
-  if (!t) return false;
-  if (KNOWN_COMMENT_RE.test(t)) return true;
-  if (/^GAMEFY/i.test(t) || /^PS\d/i.test(t)) return true;
-  if (/\d{1,2}[./-]\d{1,2}[./-]\d{2,4}/.test(t)) return false;
-  if (/\d{1,2}:\d{2}(?::\d{2})?/.test(t)) return false;
-  if (/\bpage\s*\d/i.test(t)) return false;
-  if (/^(cashier|reports?|filter status|showing page)\b/i.test(t)) return false;
-  if (/^[A-Za-z][\w.-]*\d[\w.-]*$/.test(t)) return false;
-  return true;
-}
-
-function takeKnownComment(text) {
-  const m = (text || '').match(KNOWN_COMMENT_RE);
-  return m ? m[0].replace(/\.$/, '').trim() : '';
-}
-
-function splitTypeAndComment(description, afterAmount) {
-  let desc = stripStrayTail((description || '').replace(/\s+/g, ' '));
-  let comment = stripStrayTail((afterAmount || '').replace(/\s+/g, ' '));
-
-  const typeMatch = desc.match(TX_TYPE_RE);
-  let extra = '';
-  if (typeMatch) {
-    extra = desc.slice(typeMatch[0].length).replace(/^[\s.:\-–—]+/, '').trim();
-    desc = typeMatch[1];
-  }
-
-  const fromExtra = takeKnownComment(extra);
-  if (fromExtra) {
-    comment = fromExtra;
-    extra = extra.replace(KNOWN_COMMENT_RE, '').trim();
-  } else if (extra && isUsefulComment(extra) && !comment) {
-    comment = extra;
-    extra = '';
-  } else if (extra) {
-    desc = `${desc} ${extra}`.trim();
-  }
-
-  const fromComment = takeKnownComment(comment);
-  if (fromComment) comment = fromComment;
-  else if (!isUsefulComment(comment)) comment = '';
-
-  if (!comment) {
-    const fromDesc = takeKnownComment(desc);
-    if (fromDesc) {
-      comment = fromDesc;
-      desc = desc.replace(KNOWN_COMMENT_RE, '').replace(/\s+/g, ' ').trim();
-    }
-  }
-
-  return {
-    description: desc.replace(/\s+/g, ' ').trim(),
-    comment: comment.replace(/\s+/g, ' ').trim(),
-  };
-}
-
-function cutAtNextStamp(body) {
-  const re = /\s+(?:taktek\s+)?\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\s+\d{1,2}:\d{2}(?::\d{2})?\s+(?:Income|Expense|Recette|D[ée]pense)\b/i;
-  const m = body.match(re);
-  if (m && m.index > 0) return body.slice(0, m.index).trim();
-  return body;
-}
-
-function isJunkDescription(description, comment, amount) {
-  const t = `${description} ${comment}`.toLowerCase().trim();
-  if (!t) return true;
-  if (/^(page|reports?|cashier|date|income\/expense|payment method|transaction type|amount|comment|filter status|report result)\b/.test(t)) return true;
-  if (/\bpage\s*\d+\s*\/\s*\d+\b/.test(t)) return true;
-  if (/^reports?\b/.test(t) && amount >= 1900 && amount <= 2100) return true;
-  return false;
-}
-
-function formatIsoDate(d, m, y) {
-  let year = parseInt(y, 10);
-  if (year < 100) year += 2000;
-  const day = parseInt(d, 10);
-  const month = parseInt(m, 10);
-  if (day < 1 || day > 31 || month < 1 || month > 12) return null;
-  return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-}
-
-function extractBalancedParen(text) {
-  const start = text.indexOf('(');
-  if (start === -1) return null;
-  let depth = 0;
-  for (let i = start; i < text.length; i++) {
-    if (text[i] === '(') depth++;
-    else if (text[i] === ')') {
-      depth--;
-      if (depth === 0) {
-        return {
-          before: text.slice(0, start).trim(),
-          inner: text.slice(start + 1, i).trim(),
-          after: text.slice(i + 1).trim(),
-        };
-      }
-    }
-  }
-  return {
-    before: text.slice(0, start).trim(),
-    inner: text.slice(start + 1).replace(/\)+$/, '').trim(),
-    after: '',
-  };
-}
-
-function findAmountSplit(body) {
-  const tndRe = /(-?\d{1,3}(?:[.\s]\d{3})*(?:[.,]\d{1,3})|-?\d+[.,]\d{1,3}|-?\d+)\s*(?:TND|DT)\b/gi;
-  const tndHits = [...body.matchAll(tndRe)];
-  if (tndHits.length) {
-    const m = tndHits[tndHits.length - 1];
-    return { amount: parseMoneyToken(m[1]), index: m.index, length: m[0].length };
-  }
-
-  const decRe = /(-?\d{1,3}(?:[.\s]\d{3})*[.,]\d{2,3}|-?\d+[.,]\d{2,3})\b/g;
-  const decHits = [...body.matchAll(decRe)];
-  if (decHits.length) {
-    const m = decHits[decHits.length - 1];
-    return { amount: parseMoneyToken(m[1]), index: m.index, length: m[0].length };
-  }
-
-  return null;
-}
-
-function parseTaktekRows(text, fileDate) {
-  const startRe = /(?:taktek\s+)?(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+(Income|Expense|Recette|D[ée]pense)\b/gi;
-  const starts = [];
-  let match;
-  while ((match = startRe.exec(text)) !== null) {
-    starts.push({
-      index: match.index,
-      date: formatIsoDate(match[1], match[2], match[3]) || fileDate,
-      typeRaw: match[5],
-      after: match.index + match[0].length,
-    });
-  }
-
-  const rows = [];
-  for (let i = 0; i < starts.length; i++) {
-    const start = starts[i];
-    const end = i + 1 < starts.length ? starts[i + 1].index : text.length;
-    let body = text.slice(start.after, end).replace(/\s+/g, ' ').trim();
-    body = cutAtNextStamp(body);
-    body = body.replace(/\s*Page\s*\d+\s*\/\s*\d+.*$/i, '').trim();
-    body = body.replace(/\s*(?:Cashier|Filter Status|Report Result|Reports|Showing page|Income\/Expense|Payment Method|Transaction Type)\b.*$/i, '').trim();
-
-    const pay = body.match(/^(Cash|Credit Card|Debit Card|TPE|Esp[eè]ces|Carte)\s+/i);
-    if (pay) body = body.slice(pay[0].length).trim();
-
-    const split = findAmountSplit(body);
-    if (!split || !Number.isFinite(split.amount)) continue;
-
-    let description = body.slice(0, split.index).replace(/^taktek\s+/i, '').trim();
-    let afterAmount = body.slice(split.index + split.length).replace(/^taktek\s+/i, '').trim();
-    let comment = '';
-
-    const paren = extractBalancedParen(afterAmount);
-    if (paren) {
-      comment = paren.inner;
-      afterAmount = [paren.before, paren.after].filter(Boolean).join(' ').trim();
-      if (paren.before) description = `${description} ${paren.before}`.trim();
-    } else {
-      comment = afterAmount;
-      afterAmount = '';
-    }
-
-    const cleaned = splitTypeAndComment(description.replace(/\bTND\b/ig, ''), comment);
-    description = cleaned.description;
-    comment = cleaned.comment;
-
-    const type = /expense|d[ée]pense|sortie/i.test(start.typeRaw) ? 'expense' : 'income';
-    if (isJunkDescription(description, comment, split.amount)) continue;
-
-    rows.push({
-      date: start.date,
-      type,
-      description: description || 'Entry',
-      comment,
-      amount: split.amount,
-    });
-  }
-  return rows;
-}
+const dateRegexFallback = /(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})/;
+const timeRegexFallback = /(\d{1,2}:\d{2}:\d{2})/;
 
 function parseTableText(text, day, month, year, sourceFile) {
-  const fileDate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
   const entries = [];
 
-  const pushEntry = (partial) => {
-    if (!partial) return;
-    const type = partial.type || 'income';
-    let amount = Number(partial.amount);
-    if (!Number.isFinite(amount)) return;
-    amount = Math.round(Math.abs(amount) * 100) / 100;
-    amount = type === 'expense' ? -amount : amount;
-    let description = (partial.description || '').replace(/\s+/g, ' ').trim();
-    if (!description) description = 'Entry';
-    if (isJunkDescription(description, partial.comment, Math.abs(amount))) return;
+  const rowRegex = /(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}:\d{2}:\d{2})\s+(Income|Expense)\s+(Cash|Credit Card|Debit Card)\s+(.+?)\s+(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?:\s*TND)?\s*(\([^)]*\))?/gi;
+
+  let match;
+  while ((match = rowRegex.exec(text)) !== null) {
+    const d = parseInt(match[1], 10);
+    const m = parseInt(match[2], 10);
+    const y = parseInt(match[3], 10);
+    const type = match[5].toLowerCase() === 'income' ? 'income' : 'expense';
+    let description = match[6].trim();
+    let amountStr = match[8];
+    let comment = match[9] ? match[8].replace(/^[\(\s]+|[\)\s]+$/g, '') : '';
+
+    let cleaned = amountStr.replace(/[^0-9.,-]/g, '');
+    const lastDot = cleaned.lastIndexOf('.');
+    const lastComma = cleaned.lastIndexOf(',');
+    const decSep = lastComma > lastDot ? ',' : '.';
+
+    let intPart, decPart;
+    if (decSep === ',') {
+      const p = cleaned.split(',');
+      decPart = p.pop();
+      intPart = p.join('').replace(/\./g, '');
+    } else {
+      const p = cleaned.split('.');
+      decPart = p.pop();
+      intPart = p.join('').replace(/,/g, '');
+    }
+
+    const num = parseFloat((intPart + '.' + decPart).replace(/[^0-9.-]/g, ''));
+    if (!isFinite(num)) continue;
+
+    const amount = type === 'expense' ? -Math.abs(num) : Math.abs(num);
+
+    description = description.replace(/\s+/g, ' ').trim();
+    if (!description || description.length < 2) description = 'Entry';
+
+    let entryDate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    if (d > 0 && d <= 31 && m > 0 && m <= 12) {
+      entryDate = `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+
     entries.push({
       id: crypto.randomUUID?.() ?? `${day}-${month}-${Math.random()}`,
-      date: partial.date || fileDate,
-      type,
-      description,
-      comment: (partial.comment || '').trim(),
-      amount,
-      sourceFile,
+      date: entryDate,
+      type, description, comment, amount,
     });
-  };
-
-  for (const row of parseTaktekRows(text, fileDate)) pushEntry(row);
+  }
 
   const seen = new Set();
   return entries.filter(e => {
-    const k = `${e.date}|${e.type}|${e.description}|${e.comment}|${e.amount}`;
+    const k = `${e.date}|${e.type}|${e.description}|${e.amount}`;
     if (seen.has(k)) return false;
     seen.add(k);
     return true;
@@ -1028,14 +763,17 @@ function downloadWeeklyExcel() {
   const wb = XLSX.utils.book_new();
 
   const weekNums = Array.from(weeks.keys()).sort((a, b) => a - b);
+  const addedSheets = new Set();
 
   for (const wk of weekNums) {
+    const sheetName = `Week ${wk}`;
+    if (addedSheets.has(sheetName)) continue;
+    addedSheets.add(sheetName);
     const entries = weeks.get(wk);
     const startDay = (wk - 1) * 7 + 1;
     const endDay = Math.min(wk * 7, 31);
     const weekTitle = `Vente ${wk}ème semaine`;
 
-    // Categorize entries (income only)
     const catTotals = {};
     for (const cat of CATEGORIES) catTotals[cat.label] = 0;
     catTotals['Other'] = 0;
@@ -1059,7 +797,6 @@ function downloadWeeklyExcel() {
 
     const totalHT = totalIncome - totalExpense;
 
-    // Compute weekly Cash/TPE from all source files that have entries in this week
     const weekSourceFiles = new Set(entries.map(e => e.sourceFile));
     let weekCash = 0;
     let weekTpe = 0;
@@ -1070,18 +807,14 @@ function downloadWeeklyExcel() {
       }
     }
 
-    // Build sheet rows
     const rows = [];
 
-    // Title section
     rows.push([weekTitle, '', '', '', '', '', '']);
     rows.push(['Days ' + startDay + ' to ' + endDay, '', '', '', '', '', '']);
     rows.push(['', '', '', '', '', '', '']);
 
-    // Main data table header
     rows.push(['#', 'Date', 'Type', 'Description', 'Comment', 'Amount', 'Source File']);
 
-    // All entries for this week (merged from all days)
     let rowNum = 1;
     for (const e of entries) {
       rows.push([
@@ -1095,29 +828,24 @@ function downloadWeeklyExcel() {
       ]);
     }
 
-    // Empty row separator
     rows.push(['', '', '', '', '', '', '']);
 
-    // Accounting summary section (centered below data)
     rows.push(['Désignation', 'Montant', '', '', '', '', '']);
     rows.push([weekTitle, '', '', '', '', '', '']);
     rows.push(['', '', '', '', '', '', '']);
 
-    // Category rows
     for (const cat of CATEGORIES) {
       const val = catTotals[cat.label];
       rows.push([cat.label, val === 0 ? '—' : val, '', '', '', '', '']);
     }
     rows.push(['Other', catTotals['Other'] === 0 ? '—' : catTotals['Other'], '', '', '', '', '']);
 
-    // Reconciliation rows
     const weekNetTotal = totalIncome - totalExpense;
     rows.push(['Total Amounts', weekNetTotal, '', '', '', '', '']);
     rows.push(['Total Cash', weekCash, '', '', '', '', '']);
     rows.push(['Total TPE', weekTpe, '', '', '', '', '']);
     rows.push(['Difference', weekCash + weekTpe - weekNetTotal, '', '', '', '', '']);
 
-    // Totals
     rows.push(['TOTAL HT', totalHT, '', '', '', '', '']);
     rows.push(['TVA 19%', totalHT * 0.19, '', '', '', '', '']);
     rows.push(['Droit de timbre', 1.000, '', '', '', '', '']);
@@ -1159,3 +887,6 @@ function formatMoney(n) {
 window.app = {
   removeFile, processSingle, addRow, deleteLastRow, updateCashTpe, saveCashTpe,
 };
+
+libsReady = true;
+if (btnExtract) btnExtract.disabled = false;

@@ -292,7 +292,7 @@ header {
 .btn-sm { padding: 6px 10px; font-size: 0.8rem; }
 .btn-primary { background: var(--ink); color: #fff; }
 .btn-primary:hover { background: #2a2723; }
-.btn-primary:disabled { background: #c8c3ba; cursor: not-allowed; }
+.btn-primary:disabled {\r\n  background: #c8c3ba;\r\n  color: #8a847a;\r\n  cursor: not-allowed;\r\n  opacity: 0.5;\r\n}
 .btn-secondary { background: #fff; color: var(--ink); border-color: var(--line-strong); }
 .btn-secondary:hover { background: #f3eee6; }
 .btn-outline { background: #fff; color: var(--ink); border-color: var(--line-strong); }
