@@ -10,23 +10,16 @@
 
 let pdfjsLib;
 
-function loadPdfJS() {
-  return new Promise((resolve, reject) => {
-    if (window.pdfjsLib) {
-      pdfjsLib = window.pdfjsLib;
-      resolve();
-      return;
-    }
-    const s = document.createElement('script');
-    s.src = 'https://unpkg.com/pdfjs-dist@4.8.69/build/pdf.min.js';
-    s.onload = () => {
-      pdfjsLib = window.pdfjsLib;
-      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://unpkg.com/pdfjs-dist@4.8.69/build/pdf.worker.min.js';
-      resolve();
-    };
-    s.onerror = reject;
-    document.head.appendChild(s);
-  });
+// pdf.js v4 ships ES modules only (build/pdf.min.mjs) — there is no
+// build/pdf.min.js anymore, so it must be loaded with a dynamic import.
+const PDFJS_BASE = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.8.69/build';
+
+async function loadPdfJS() {
+  if (pdfjsLib) return pdfjsLib;
+  const mod = await import(`${PDFJS_BASE}/pdf.min.mjs`);
+  mod.GlobalWorkerOptions.workerSrc = `${PDFJS_BASE}/pdf.worker.min.mjs`;
+  pdfjsLib = mod;
+  return mod;
 }
 
 // ---------------------------------------------------------------------------
@@ -39,7 +32,7 @@ let libsReady = false;
 let isProcessing = false;
 let isDownloading = false;
 let activeTabIndex = 0;
-let isUploadCollapsed = false;
+let isCollapsed = false;
 
 const EXCEL_COLS = [
   { key: 'rowNum', label: '#', width: 50 },
@@ -65,11 +58,28 @@ const CATEGORIES = [
 // ---------------------------------------------------------------------------
 let dropZone, fileInput, browseLink, fileList, btnExtract, extractSpinner;
 let stepDrop, stepTabs, tabsHeader, tabsPanels, btnMoreFiles, btnDownloadDaily, btnDownloadWeekly;
-let statsFiles, statsEntries, collapseToggle;
+let statsFiles, statsEntries, collapseToggle, expandToggle, collapsedSummaryText;
 
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
+function initDOM() {
+  dropZone = document.getElementById('dropZone');
+  fileInput = document.getElementById('fileInput');
+  browseLink = document.getElementById('browseLink');
+  fileList = document.getElementById('fileList');
+  btnExtract = document.getElementById('btnExtract');
+  extractSpinner = document.getElementById('extractSpinner');
+  stepDrop = document.getElementById('step-drop');
+  stepTabs = document.getElementById('step-tabs');
+  tabsHeader = document.getElementById('tabsHeader');
+  tabsPanels = document.getElementById('tabsPanels');
+  btnMoreFiles = document.getElementById('btnMoreFiles');
+  btnDownloadDaily = document.getElementById('btnDownloadDaily');
+  btnDownloadWeekly = document.getElementById('btnDownloadWeekly');
+  statsFiles = document.getElementById('stats-files');
+  statsEntries = document.getElementById('stats-entries');
+  collapseToggle = document.getElementById('btnCollapseUpload');
+  expandToggle = document.getElementById('btnExpandUpload');
+  collapsedSummaryText = document.getElementById('collapsedSummaryText');
+}
 window.addEventListener('DOMContentLoaded', async () => {
   initDOM();
   setupDragDrop();
@@ -93,22 +103,27 @@ window.addEventListener('DOMContentLoaded', async () => {
 // ---------------------------------------------------------------------------
 // Collapse / Expand toggle
 // ---------------------------------------------------------------------------
+function setCollapsed(collapsed) {
+  isCollapsed = collapsed;
+  if (!stepDrop) return;
+  stepDrop.classList.toggle('collapsed', collapsed);
+  if (collapsed) updateCollapsedSummary();
+}
+
+function updateCollapsedSummary() {
+  if (!collapsedSummaryText) return;
+  const totalRows = pdfFiles.reduce((s, f) => s + f.entries.length, 0);
+  if (!pdfFiles.length) {
+    collapsedSummaryText.textContent = 'No files yet';
+    return;
+  }
+  collapsedSummaryText.textContent =
+    `${pdfFiles.length} file${pdfFiles.length > 1 ? 's' : ''} · ${totalRows} row${totalRows === 1 ? '' : 's'}`;
+}
+
 function setupCollapseToggle() {
-  if (!collapseToggle || !stepDrop) return;
-  collapseToggle.addEventListener('click', () => {
-    isCollapsed = !isCollapsed;
-    if (isCollapsed) {
-      stepDrop.style.display = 'none';
-      collapseToggle.textContent = 'Expand';
-      collapseToggle.classList.add('btn-primary');
-      collapseToggle.classList.remove('btn-secondary');
-    } else {
-      stepDrop.style.display = 'block';
-      collapseToggle.textContent = 'Collapse';
-      collapseToggle.classList.remove('btn-primary');
-      collapseToggle.classList.add('btn-secondary');
-    }
-  });
+  if (collapseToggle) collapseToggle.addEventListener('click', () => setCollapsed(true));
+  if (expandToggle) expandToggle.addEventListener('click', () => setCollapsed(false));
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +157,7 @@ function setupButtons() {
   if (btnDownloadDaily) btnDownloadDaily.addEventListener('click', onDownloadDaily);
   if (btnDownloadWeekly) btnDownloadWeekly.addEventListener('click', onDownloadWeekly);
   if (btnMoreFiles) btnMoreFiles.addEventListener('click', () => {
-    if (stepDrop) stepDrop.style.display = 'block';
+    setCollapsed(false);
     if (stepTabs) stepTabs.style.display = 'none';
   });
 }
@@ -210,7 +225,7 @@ function addFiles(files) {
   renderFileList();
   updateStats();
   updateDownloadButtons();
-  if (stepDrop) stepDrop.style.display = 'block';
+  setCollapsed(false);
   if (stepTabs) stepTabs.style.display = 'none';
 }
 
@@ -223,7 +238,7 @@ function removeFile(index) {
   }
   pdfFiles.splice(index, 1);
   if (pdfFiles.length === 0) {
-    if (stepDrop) stepDrop.style.display = 'block';
+    setCollapsed(false);
     if (stepTabs) stepTabs.style.display = 'none';
     activeTabIndex = 0;
   } else {
@@ -270,6 +285,7 @@ function updateStats() {
   statsFiles.textContent = pdfFiles.length;
   const totalEntries = pdfFiles.reduce((s, f) => s + f.entries.length, 0);
   statsEntries.textContent = totalEntries;
+  updateCollapsedSummary();
 }
 
 // ---------------------------------------------------------------------------
@@ -491,18 +507,17 @@ function onExtractClick() {
   isProcessing = true;
   if (btnExtract) { btnExtract.disabled = true; if (extractSpinner) extractSpinner.style.display = 'inline-block'; }
   processAllFiles().then(() => {
-    if (stepDrop) stepDrop.style.display = 'none';
+    setCollapsed(true);
     if (stepTabs) stepTabs.style.display = 'block';
-    isCollapsed = true;
-    if (collapseToggle) {
-      collapseToggle.textContent = 'Expand';
-      collapseToggle.classList.add('btn-primary');
-      collapseToggle.classList.remove('btn-secondary');
-    }
     renderTabs();
+  }).catch(err => {
+    console.error(err);
+    showToast('error', 'Extraction failed', err && err.message ? err.message : String(err));
   }).finally(() => {
     isProcessing = false;
     if (btnExtract) { btnExtract.disabled = false; if (extractSpinner) extractSpinner.style.display = 'none'; }
+    // re-render so the "Processing..." buttons go back to "Re-process"
+    if (stepTabs && stepTabs.style.display === 'block') renderTabs();
   });
 }
 
@@ -515,12 +530,17 @@ function onDownloadWeekly() {
   if (isDownloading) return;
   if (!validateCashTpe()) return;
   isDownloading = true;
-  downloadWeeklyExcel().then(() => { isDownloading = false; });
+  try {
+    downloadWeeklyExcel();
+  } finally {
+    isDownloading = false;
+  }
 }
 
 async function processAllFiles() {
   for (const f of pdfFiles) {
     await processPdf(f);
+    updateStats();
   }
   renderFileList();
   renderTabs();
@@ -572,10 +592,24 @@ async function processPdf(f) {
 const dateRegexFallback = /(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})/;
 const timeRegexFallback = /(\d{1,2}:\d{2}:\d{2})/;
 
+function parseAmount(raw) {
+  const s = String(raw || '').replace(/[^0-9.,-]/g, '').trim();
+  if (!s) return NaN;
+  const lastSep = Math.max(s.lastIndexOf('.'), s.lastIndexOf(','));
+  if (lastSep === -1) return parseFloat(s);
+  const tail = s.slice(lastSep + 1);
+  const head = s.slice(0, lastSep).replace(/[.,]/g, '') || '0';
+  // Three trailing digits mean a thousands group ("8,000" -> 8000),
+  // anything shorter is a decimal part ("8,50" -> 8.5).
+  return tail.length === 3 ? parseFloat(head + tail) : parseFloat(head + '.' + tail);
+}
+
 function parseTableText(text, day, month, year, sourceFile) {
   const entries = [];
 
-  const rowRegex = /(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}:\d{2}:\d{2})\s+(Income|Expense)\s+(Cash|Credit Card|Debit Card)\s+(.+?)\s+(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?:\s*TND)?\s*(\([^)]*\))?/gi;
+  // The amount must be followed by whitespace, a closing paren or end of text,
+  // otherwise things like "Playstation 1h" get read as an amount of 1.
+  const rowRegex = /(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}:\d{2}:\d{2})\s+(Income|Expense)\s+(Cash|Credit Card|Debit Card)\s+(.+?)\s+(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?=[\s)]|$)(?:\s*TND)?\s*(\([^)]*\))?/gi;
 
   let match;
   while ((match = rowRegex.exec(text)) !== null) {
@@ -583,27 +617,11 @@ function parseTableText(text, day, month, year, sourceFile) {
     const m = parseInt(match[2], 10);
     const y = parseInt(match[3], 10);
     const type = match[5].toLowerCase() === 'income' ? 'income' : 'expense';
-    let description = match[6].trim();
-    let amountStr = match[8];
-    let comment = match[9] ? match[8].replace(/^[\(\s]+|[\)\s]+$/g, '') : '';
+    let description = match[7].trim();
+    const amountStr = match[8];
+    const comment = match[9] ? match[9].replace(/^[(\s]+|[)\s]+$/g, '') : '';
 
-    let cleaned = amountStr.replace(/[^0-9.,-]/g, '');
-    const lastDot = cleaned.lastIndexOf('.');
-    const lastComma = cleaned.lastIndexOf(',');
-    const decSep = lastComma > lastDot ? ',' : '.';
-
-    let intPart, decPart;
-    if (decSep === ',') {
-      const p = cleaned.split(',');
-      decPart = p.pop();
-      intPart = p.join('').replace(/\./g, '');
-    } else {
-      const p = cleaned.split('.');
-      decPart = p.pop();
-      intPart = p.join('').replace(/,/g, '');
-    }
-
-    const num = parseFloat((intPart + '.' + decPart).replace(/[^0-9.-]/g, ''));
+    const num = parseAmount(amountStr);
     if (!isFinite(num)) continue;
 
     const amount = type === 'expense' ? -Math.abs(num) : Math.abs(num);
@@ -748,7 +766,7 @@ function downloadDailyExcel() {
 
   const fname = `Gamefy_Daily_Invoices_Month${currentYear}.xlsx`;
   XLSX.writeFile(wb, fname);
-  alert('Downloaded: ' + fname);
+  showToast('success', 'Downloaded', fname);
 }
 
 // ---------------------------------------------------------------------------
@@ -868,7 +886,7 @@ function downloadWeeklyExcel() {
 
   const fname = `Gamefy_Weekly_Invoices_Month${currentYear}.xlsx`;
   XLSX.writeFile(wb, fname);
-  alert('Downloaded: ' + fname);
+  showToast('success', 'Downloaded', fname);
 }
 
 // ---------------------------------------------------------------------------
@@ -885,8 +903,10 @@ function formatMoney(n) {
 }
 
 window.app = {
-  removeFile, processSingle, addRow, deleteLastRow, updateCashTpe, saveCashTpe,
+  removeFile,
+  processSingle: window.processSingle,
+  addRow: window.addRow,
+  deleteLastRow: window.deleteLastRow,
+  updateCashTpe: window.updateCashTpe,
+  saveCashTpe: window.saveCashTpe,
 };
-
-libsReady = true;
-if (btnExtract) btnExtract.disabled = false;
