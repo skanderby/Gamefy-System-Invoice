@@ -33,6 +33,7 @@ let isProcessing = false;
 let isDownloading = false;
 let activeTabIndex = 0;
 let isCollapsed = false;
+let suppressOnChange = false;  // guard: prevent onchange from clearing data during spreadsheet init
 
 const EXCEL_COLS = [
   { key: 'rowNum', label: '#', width: 50 },
@@ -414,6 +415,7 @@ function initSpreadsheet(tabIndex) {
   }
 
   try {
+    suppressOnChange = true;  // prevent onchange from wiping entry data during init
     const inst = jspreadsheet(container, {
       data: data,
       columns: columns,
@@ -427,17 +429,20 @@ function initSpreadsheet(tabIndex) {
         handleSpreadsheetChange(tabIndex, y, x, value);
       },
     });
+    suppressOnChange = false;
 
     spreadsheetInstances[tabIndex] = inst;
     console.log('jspreadsheet created successfully for tab', tabIndex);
     updateReconciliation(tabIndex);
   } catch (err) {
+    suppressOnChange = false;
     console.error('jspreadsheet error:', err);
     container.innerHTML = '<div style="padding:20px;color:#ef4444;">Excel editor failed to load.</div>';
   }
 }
 
 function handleSpreadsheetChange(tabIndex, rowIndex, colIndex, value) {
+  if (suppressOnChange) return;  // ignore events fired during spreadsheet init
   const f = pdfFiles[tabIndex];
   if (!f || rowIndex >= f.entries.length) return;
   const e = f.entries[rowIndex];
@@ -604,46 +609,126 @@ function parseAmount(raw) {
   return tail.length === 3 ? parseFloat(head + tail) : parseFloat(head + '.' + tail);
 }
 
+// Rows look like:
+//   taktek 28.10.2026 01:50:49 Income Cash Order Incomes 7,00 TND (PS5 (2))
+//   taktek 27.10.2026 21:07:48 Income Cash Member Transactions 39,00 TND Money deposited to member account. (lucy)
+// i.e. <cashier> <date> <time> <type> <payment> <transaction type> <amount> TND <comment>
+const ROW_START_RE = /(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}:\d{2}:\d{2})\s+/g;
+const PAYMENT_RE = /^(Cash|Credit\s*Card|Debit\s*Card|Cheque|Check|Bank\s*Transfer|Virement|Esp[eè]ces)\b\s*/i;
+
+// "(PS5 (2))" -> "PS5 (2)", "(GAMEFY03)" -> "GAMEFY03",
+// "Money deposited to member account. (lucy)" stays untouched.
+function cleanComment(raw) {
+  let t = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';
+  if (t.startsWith('(') && t.endsWith(')') && t.length > 2) {
+    const inner = t.slice(1, -1).trim();
+    const opens = (inner.match(/\(/g) || []).length;
+    const closes = (inner.match(/\)/g) || []).length;
+    if (opens === closes) t = inner;
+  }
+  return t;
+}
+
+// Splits "<transaction type> <amount> TND <comment>" without guessing.
+function splitBody(body) {
+  const tokens = body.split(/\s+/).filter(Boolean);
+  const tndAt = tokens.findIndex(t => /^TND$/i.test(t));
+  if (tndAt > 0) {
+    const amountStr = tokens[tndAt - 1];
+    if (/^\d[\d.,]*$/.test(amountStr)) {
+      return {
+        description: tokens.slice(0, tndAt - 1).join(' '),
+        amountStr,
+        comment: tokens.slice(tndAt + 1).join(' '),
+      };
+    }
+  }
+  // No "TND" on the row: fall back to the last numeric token, capture remaining text as comment.
+  const lastNumeric = tokens.map((t, i) => (/^\d[\d.,]*$/.test(t) ? i : -1)).filter(i => i >= 0).pop();
+  if (lastNumeric === undefined) return null;
+  return {
+    description: tokens.slice(0, lastNumeric).join(' '),
+    amountStr: tokens[lastNumeric],
+    comment: tokens.slice(lastNumeric + 1).join(' '),
+  };
+}
+
 function parseTableText(text, day, month, year, sourceFile) {
   const entries = [];
 
-  // The amount must be followed by whitespace, a closing paren or end of text,
-  // otherwise things like "Playstation 1h" get read as an amount of 1.
-  const rowRegex = /(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}:\d{2}:\d{2})\s+(Income|Expense)\s+(Cash|Credit Card|Debit Card)\s+(.+?)\s+(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?=[\s)]|$)(?:\s*TND)?\s*(\([^)]*\))?/gi;
+  // Cut the text into one chunk per row (a row starts at a date + time).
+  ROW_START_RE.lastIndex = 0;
+  const starts = [];
+  let start;
+  while ((start = ROW_START_RE.exec(text)) !== null) {
+    starts.push({
+      index: start.index,
+      headerLength: start[0].length,
+      day: parseInt(start[1], 10),
+      month: parseInt(start[2], 10),
+      year: parseInt(start[3], 10),
+    });
+  }
 
-  let match;
-  while ((match = rowRegex.exec(text)) !== null) {
-    const d = parseInt(match[1], 10);
-    const m = parseInt(match[2], 10);
-    const y = parseInt(match[3], 10);
-    const type = match[5].toLowerCase() === 'income' ? 'income' : 'expense';
-    let description = match[7].trim();
-    const amountStr = match[8];
-    const comment = match[9] ? match[9].replace(/^[(\s]+|[)\s]+$/g, '') : '';
+  for (let i = 0; i < starts.length; i++) {
+    const row = starts[i];
+    const chunkEnd = i + 1 < starts.length ? starts[i + 1].index : text.length;
+    let rest = text.slice(row.index + row.headerLength, chunkEnd).trim();
 
-    const num = parseAmount(amountStr);
+    const typeMatch = rest.match(/^(Income|Expense)\b\s*/i);
+    if (!typeMatch) continue;
+    const type = typeMatch[1].toLowerCase() === 'income' ? 'income' : 'expense';
+    rest = rest.slice(typeMatch[0].length);
+
+    const paymentMatch = rest.match(PAYMENT_RE);
+    if (paymentMatch) rest = rest.slice(paymentMatch[0].length);
+
+    const parts = splitBody(rest);
+    if (!parts) continue;
+
+    const num = parseAmount(parts.amountStr);
     if (!isFinite(num)) continue;
 
     const amount = type === 'expense' ? -Math.abs(num) : Math.abs(num);
 
-    description = description.replace(/\s+/g, ' ').trim();
+    let description = parts.description.replace(/\s+/g, ' ').trim();
     if (!description || description.length < 2) description = 'Entry';
+    let comment = cleanComment(parts.comment);
+
+    // If comment is empty but description contains a trailing parenthetical
+    // identifier like "(GAMEFY03)" or "(PS5 (1))", extract it as the comment.
+    if (!comment && description.includes('(')) {
+      const firstParen = description.indexOf('(');
+      if (firstParen > 0) {
+        const potentialComment = description.slice(firstParen).trim();
+        const remaining = description.slice(0, firstParen).trim();
+        if (remaining.length > 2) {
+          const extracted = cleanComment(potentialComment);
+          if (extracted) {
+            comment = extracted;
+            description = remaining;
+          }
+        }
+      }
+    }
 
     let entryDate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-    if (d > 0 && d <= 31 && m > 0 && m <= 12) {
-      entryDate = `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    if (row.day > 0 && row.day <= 31 && row.month > 0 && row.month <= 12) {
+      entryDate = `${String(row.year).padStart(4, '0')}-${String(row.month).padStart(2, '0')}-${String(row.day).padStart(2, '0')}`;
     }
 
     entries.push({
       id: crypto.randomUUID?.() ?? `${day}-${month}-${Math.random()}`,
       date: entryDate,
       type, description, comment, amount,
+      sourceFile,
     });
   }
 
   const seen = new Set();
   return entries.filter(e => {
-    const k = `${e.date}|${e.type}|${e.description}|${e.amount}`;
+    const k = `${e.date}|${e.type}|${e.description}|${e.amount}|${e.comment}`;
     if (seen.has(k)) return false;
     seen.add(k);
     return true;
@@ -770,7 +855,7 @@ function downloadDailyExcel() {
 }
 
 // ---------------------------------------------------------------------------
-// Excel export: Weekly (one sheet per week with all rows + accounting summary below)
+// Excel export: Weekly (one sheet per week, all rows of the week)
 // ---------------------------------------------------------------------------
 function downloadWeeklyExcel() {
   if (!pdfFiles.length) { alert('Nothing to export'); return; }
@@ -792,39 +877,6 @@ function downloadWeeklyExcel() {
     const endDay = Math.min(wk * 7, 31);
     const weekTitle = `Vente ${wk}ème semaine`;
 
-    const catTotals = {};
-    for (const cat of CATEGORIES) catTotals[cat.label] = 0;
-    catTotals['Other'] = 0;
-
-    let totalIncome = 0;
-    let totalExpense = 0;
-
-    for (const e of entries) {
-      if (e.type === 'income') totalIncome += Math.abs(e.amount);
-      else totalExpense += Math.abs(e.amount);
-
-      if (e.type === 'income') {
-        const cat = categorize(e.description);
-        if (catTotals[cat] !== undefined) {
-          catTotals[cat] += Math.abs(e.amount);
-        } else {
-          catTotals['Other'] += Math.abs(e.amount);
-        }
-      }
-    }
-
-    const totalHT = totalIncome - totalExpense;
-
-    const weekSourceFiles = new Set(entries.map(e => e.sourceFile));
-    let weekCash = 0;
-    let weekTpe = 0;
-    for (const f of pdfFiles) {
-      if (weekSourceFiles.has(f.name)) {
-        weekCash += f.cashAmount || 0;
-        weekTpe += f.tpeAmount || 0;
-      }
-    }
-
     const rows = [];
 
     rows.push([weekTitle, '', '', '', '', '', '']);
@@ -842,32 +894,9 @@ function downloadWeeklyExcel() {
         e.description,
         e.comment || '',
         e.type === 'income' ? Math.abs(e.amount) : -Math.abs(e.amount),
-        e.sourceFile,
+        e.sourceFile || '',
       ]);
     }
-
-    rows.push(['', '', '', '', '', '', '']);
-
-    rows.push(['Désignation', 'Montant', '', '', '', '', '']);
-    rows.push([weekTitle, '', '', '', '', '', '']);
-    rows.push(['', '', '', '', '', '', '']);
-
-    for (const cat of CATEGORIES) {
-      const val = catTotals[cat.label];
-      rows.push([cat.label, val === 0 ? '—' : val, '', '', '', '', '']);
-    }
-    rows.push(['Other', catTotals['Other'] === 0 ? '—' : catTotals['Other'], '', '', '', '', '']);
-
-    const weekNetTotal = totalIncome - totalExpense;
-    rows.push(['Total Amounts', weekNetTotal, '', '', '', '', '']);
-    rows.push(['Total Cash', weekCash, '', '', '', '', '']);
-    rows.push(['Total TPE', weekTpe, '', '', '', '', '']);
-    rows.push(['Difference', weekCash + weekTpe - weekNetTotal, '', '', '', '', '']);
-
-    rows.push(['TOTAL HT', totalHT, '', '', '', '', '']);
-    rows.push(['TVA 19%', totalHT * 0.19, '', '', '', '', '']);
-    rows.push(['Droit de timbre', 1.000, '', '', '', '', '']);
-    rows.push(['Total TTC', totalHT + totalHT * 0.19 + 1.000, '', '', '', '', '']);
 
     const ws = XLSX.utils.aoa_to_sheet(rows);
 
