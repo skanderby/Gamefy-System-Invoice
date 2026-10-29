@@ -664,7 +664,7 @@ function parseTableText(text, day, month, year, sourceFile) {
 
   // Strip PDF report footer/summary section (page 2+ metadata like
   // "22/10/2026 16:35:21 Page 1/2 Filter Status : Cashier All ...")
-  cleanText = cleanText.replace(/\s*\d{1,2}\/\d{1,2}\/\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+Page\s+\d+[\s\S]*/i, '');
+  cleanText = cleanText.replace(/\s*(?:Page\s+\d+\/\d+|\b\d{1,2}[\/\.]\d{1,2}[\/\.]\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+Page|Filter Status\s*:|Report Result\s*:)[\s\S]*/i, '');
 
   // Cut the text into one chunk per row (a row starts at a date + time).
   ROW_START_RE.lastIndex = 0;
@@ -722,11 +722,21 @@ function parseTableText(text, day, month, year, sourceFile) {
         }
       }
 
-      // If comment has a descriptive sentence (ending with ".") followed by
-      // a trailing parenthetical (like a member ID), keep only the sentence.
-      // e.g. "Money deposited to member account. (prime_, IIc7046)" → "Money deposited to member account."
+      // Clean up comments:
       if (comment) {
-        comment = comment.replace(/\.\s*\([^)]*\)\s*$/, '.').trim();
+        // 1. If it contains page/report footer text, strip everything from the footer start
+        const footerMatch = comment.search(/(\d{1,2}[\/\.]\d{1,2}[\/\.]\d{4}\s+\d{1,2}:\d{2}|Page\s+\d+|Filter Status|Report Result)/i);
+        if (footerMatch !== -1) {
+          comment = comment.slice(0, footerMatch).trim();
+        }
+
+        // 2. If it's a member deposit, user specifically wants "Money deposited to member account." only
+        if (/^Money deposited to member account/i.test(comment)) {
+          comment = 'Money deposited to member account.';
+        } else {
+          // Strip trailing member/account parentheses like "(prime_lillo7046)" if preceded by a sentence
+          comment = comment.replace(/\.\s*\([^)]*\)\s*$/, '.').trim();
+        }
       }
 
       let entryDate = `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
