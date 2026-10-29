@@ -662,9 +662,8 @@ function parseTableText(text, day, month, year, sourceFile) {
   // Without this, the cashier name leaks into the previous row's comment.
   let cleanText = text.replace(/\b[a-zA-Z_]\w*\s+(?=\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2}:\d{2})/g, '');
 
-  // Strip PDF report footer/summary section (page 2+ metadata like
-  // "22/10/2026 16:35:21 Page 1/2 Filter Status : Cashier All ...")
-  cleanText = cleanText.replace(/\s*(?:Page\s+\d+\/\d+|\b\d{1,2}[\/\.]\d{1,2}[\/\.]\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+Page|Filter Status\s*:|Report Result\s*:)[\s\S]*/i, '');
+  // Strip PDF report footer/summary section at the end of the document
+  cleanText = cleanText.replace(/\s*(?:Filter Status\s*:|Report Result\s*:)[\s\S]*/i, '');
 
   // Cut the text into one chunk per row (a row starts at a date + time).
   ROW_START_RE.lastIndex = 0;
@@ -752,13 +751,7 @@ function parseTableText(text, day, month, year, sourceFile) {
       });
     }
 
-    const seen = new Set();
-    return entries.filter(e => {
-      const k = `${e.date}|${e.type}|${e.description}|${e.amount}|${e.comment}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    });
+    return entries;
   }
 
   // ---------------------------------------------------------------------------
